@@ -1,5 +1,5 @@
-# Kinetics Data Analysis v1.0 - Progress curves analysis with AvaSpec-NEXOS integration
-[![Version](https://img.shields.io/badge/version-v1.0-brightgreen)](https://github.com/username/kinetics-analyzer/releases)  [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)  [![Streamlit](https://img.shields.io/badge/streamlit-1.0%2B-orange)](https://streamlit.io/)  [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+# Kinetics Data Analysis v1.1 - Progress curves analysis with AvaSpec-NEXOS integration
+[![Version](https://img.shields.io/badge/version-v1.1-brightgreen)](https://github.com/username/kinetics-analyzer/releases)  [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)  [![Streamlit](https://img.shields.io/badge/streamlit-1.51%2B-orange)](https://streamlit.io/)  [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 A user-friendly web application for analyzing enzyme kinetics progress curves. It enables interactive visualization, region selection, and statistical analysis of time-course absorbance data. The tool specializes in linear regression of selected regions and supports unit conversions.
 
@@ -16,7 +16,9 @@ The web application is freely available online and provides full functionality w
 - **Extinction Coefficient Support**: Convert absorbance slopes to concentration units
 - **Statistical Validation**: R², RMSE, and standard error calculations
 - **Multiple Dataset Overlay**: Compare multiple experiments simultaneously
-- **Enzyme Activity Calculations**: Convert rates to U/mL or U/mg with volume/mass parameters
+- **Enzyme Activity Calculations**: Convert rates to U/mL or U/mg with volume/mass parameters, in single-region and batch analysis
+- **Batch Analysis**: Apply the same time window and conversions to many datasets at once
+- **Save / Load Session**: Store all datasets, regions and settings in a JSON file and restore them later
 
 ### **Visualization**
 - **Interactive Tools**: Zoom, pan, hover, and direct region selection
@@ -26,8 +28,6 @@ The web application is freely available online and provides full functionality w
 ### **Robust Unit Management**
 - **Extinction Coefficient Integration**: Automatic absorbance-to-concentration conversion
 - **Enzyme Units**: Calculate specific activity (U/mL, U/mg)
-- **Transformed Standard Errors**: Statistical accuracy maintained through unit conversions
-- **Dual Export Format**: Both original absorbance and converted slopes in results
 
 ### **Data Import & Export**
 - **Multiple Formats**: TXT, CSV, Excel (.xlsx, .xls) support
@@ -65,7 +65,7 @@ conda create -n kinetics python=3.10
 conda activate kinetics
 
 # Install dependencies (choose one):
-pip install streamlit plotly pandas numpy scipy pint openpyxl
+pip install streamlit plotly pandas numpy scipy openpyxl matplotlib
 # OR use requirements file:
 pip install -r requirements.txt
 
@@ -77,7 +77,7 @@ streamlit run kinetics_analyzer.py
 
 ```bash
 # Install dependencies (choose one):
-pip install streamlit plotly pandas numpy scipy pint openpyxl
+pip install streamlit plotly pandas numpy scipy openpyxl matplotlib
 # OR use requirements file:
 pip install -r requirements.txt
 
@@ -119,10 +119,7 @@ If you're using **Windows** and have Python installed via the **Microsoft Store*
 If you have raw Excel files from the AvaSpec-NEXOS spectrometer, use the provided conversion tool first:
 
 ```bash
-# Navigate to the data_processing folder
-cd data_processing
-
-# Run the conversion script
+# Run the conversion script in the folder that holds your Excel files
 python avaspec_excel_to_txt.py
 ```
 
@@ -148,11 +145,14 @@ The script will:
    - Use box select tool in plot toolbar
    - Drag across desired time range
    - Selected region appears highlighted in green
+   - Click **➕ Add region from selection** to analyze it straight away
 4. **Configure Analysis**:
-   - Set extinction coefficient for concentration conversions
+   - Set extinction coefficient and path length for concentration conversions
    - Choose target units (mM, μM, per second/minute)
+   - Optionally enable enzyme units (needs the extinction coefficient)
 5. **Add Region**: Click "Add Region" to perform analysis
-6. **Export Results**: Download Excel reports
+6. **Export Results**: Download Excel or CSV reports
+7. **Save Session**: Use "💾 Save session" in the sidebar to keep your work; load it later with "📂 Load session"
 
 ### 3. **Features**
 - **Multiple Regions**: Analyze different phases of the same experiment
