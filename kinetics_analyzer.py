@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Enzyme Kinetics Analyzer v1 - Streamlit Web Application
+Enzyme Kinetics Analyzer v1.1 - Streamlit Web Application
 Interactive web-based tool for progress curves analysis with AvaSpec integration.
 Uses Streamlit for the web interface and Plotly for interactive plotting.
 """
@@ -8,23 +8,18 @@ Uses Streamlit for the web interface and Plotly for interactive plotting.
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
-import numpy as np
-from scipy import stats
-import pint
 from pathlib import Path
-import re
 import io
-import tempfile
-import subprocess
-import sys
-from typing import Dict, Tuple, List, Optional, Union
-import base64
+import zipfile
+from typing import Dict, Tuple, List, Optional
 import random
 import logging
 from datetime import datetime
 import warnings
+
+import kinetics_core
+
+APP_VERSION = "1.1"
 
 # Configure logging for debugging
 logging.basicConfig(level=logging.INFO)
@@ -34,11 +29,16 @@ logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 st.set_page_config(
-    page_title="Kinetics Analyzer v1",
+    page_title=f"Kinetics Analyzer v{APP_VERSION}",
     page_icon="☕",
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+def _clamp(value: float, low: float, high: float) -> float:
+    """Keep a plot selection inside the data range (box selections can overshoot the axes)."""
+    return float(min(max(value, low), high))
+
 
 class ColorPalette:
     """Centralized color management for consistent styling across the application."""
@@ -87,9 +87,12 @@ class ColorPalette:
             return self.nostalgic_palette
         return self.viridis_palette
     
-    def select_colors(self, n_datasets: int, palette_type: str = 'viridis') -> List[str]:
+    def select_colors(self, n_datasets: int, palette_type: str = 'viridis', dark: bool = False) -> List[str]:
         """Select colors with maximum contrast for given number of datasets."""
         full_colors = self.get_colors(palette_type)
+        if dark:
+            # Skip colors that disappear on a dark background (black, deep purples)
+            full_colors = full_colors[1:10] if palette_type == 'nostalgic' else full_colors[3:10]
         
         if palette_type == 'nostalgic':
             # For nostalgic palette, use sequential order
@@ -112,10 +115,6 @@ class ColorPalette:
 
 class AvaSpecIntegration:
     """Handle AvaSpec Excel file detection and conversion."""
-    
-    def __init__(self):
-        self.conversion_script_path = Path(__file__).parent / "avaspec_excel_to_txt.py"
-        logger.info(f"AvaSpec integration initialized. Script path: {self.conversion_script_path}")
     
     def is_avaspec_excel(self, uploaded_file) -> bool:
         """
@@ -162,49 +161,18 @@ class AvaSpecIntegration:
         Returns converted DataFrame or None if conversion fails.
         """
         try:
-            # Save uploaded file to temporary location
-            with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp_file:
-                tmp_file.write(uploaded_file.getvalue())
-                tmp_excel_path = Path(tmp_file.name)
-            
-            # Read Excel file in AvaSpec format
-            df = pd.read_excel(tmp_excel_path, sheet_name=0, skiprows=3, header=None)
-            
+            uploaded_file.seek(0)
+            df = pd.read_excel(io.BytesIO(uploaded_file.getvalue()), sheet_name=0, skiprows=3, header=None)
+
             if df.empty or len(df.columns) < 3:
                 logger.error("AvaSpec Excel file doesn't have expected structure")
-                tmp_excel_path.unlink()  # Cleanup
                 return None
-            
-            # Process data according to AvaSpec format
-            valid_rows = []
-            for idx, row in df.iterrows():
-                raw_time_ms = row.iloc[1]  # Column B (time in ms)
-                raw_absorbance = row.iloc[2]  # Column C (absorbance)
-                
-                # Check if both values are numeric and not empty
-                if pd.notna(raw_time_ms) and pd.notna(raw_absorbance):
-                    try:
-                        # Convert time from ms to s
-                        time_sec = float(raw_time_ms) / 1000.0
-                        
-                        # Handle absorbance - convert to string and ensure dot decimal
-                        absorbance_str = str(raw_absorbance).replace(',', '.')
-                        absorbance = float(absorbance_str)
-                        
-                        valid_rows.append([time_sec, absorbance])
-                        
-                    except (ValueError, TypeError):
-                        continue
-            
-            # Cleanup temporary file
-            tmp_excel_path.unlink()
-            
-            if not valid_rows:
+
+            result_df = kinetics_core.parse_avaspec_rows(df)
+            if result_df.empty:
                 logger.error("No valid data found in AvaSpec Excel file")
                 return None
-            
-            # Create standardized DataFrame
-            result_df = pd.DataFrame(valid_rows, columns=['time', 'product'])
+
             logger.info(f"Successfully converted AvaSpec Excel file: {len(result_df)} data points")
             return result_df
             
@@ -221,8 +189,9 @@ class MemoryManager:
         if not hasattr(st.session_state, 'data_sets'):
             return
         
-        datasets_to_remove = [name for name in st.session_state.data_sets.keys() 
-                            if name not in current_filenames]
+        session_loaded = st.session_state.get('session_loaded_datasets', set())
+        datasets_to_remove = [name for name in st.session_state.data_sets.keys()
+                              if name not in current_filenames and name not in session_loaded]
         
         for dataset_name in datasets_to_remove:
             # Remove from data_sets
@@ -248,21 +217,6 @@ class MemoryManager:
                 dataset_name in st.session_state.avaspec_converted_files):
                 del st.session_state.avaspec_converted_files[dataset_name]
                 logger.info(f"Cleaned up AvaSpec converted file tracking for dataset: {dataset_name}")
-    
-    @staticmethod
-    def get_memory_usage() -> Dict[str, int]:
-        """Get current memory usage statistics."""
-        usage = {}
-        if hasattr(st.session_state, 'data_sets'):
-            usage['datasets'] = len(st.session_state.data_sets)
-            total_points = sum(len(df) for df in st.session_state.data_sets.values())
-            usage['total_data_points'] = total_points
-        
-        if hasattr(st.session_state, 'regions'):
-            total_regions = sum(len(regions) for regions in st.session_state.regions.values())
-            usage['total_regions'] = total_regions
-        
-        return usage
 
 class BatchAnalyzer:
     """
@@ -273,12 +227,7 @@ class BatchAnalyzer:
     def __init__(self, main_app):
         self.main_app = main_app
         self.max_iterations = 100  # Safety limit to prevent infinite loops
-        self.progress_callback = None
-    
-    def set_progress_callback(self, callback):
-        """Set callback function for progress updates."""
-        self.progress_callback = callback
-    
+
     def validate_batch_parameters(self, datasets: List[str], time_frame: Tuple[float, float]) -> bool:
         """
         Validate batch analysis parameters to prevent issues.
@@ -374,7 +323,8 @@ class BatchAnalyzer:
                         analysis_params.get('extinction_coeff'),
                         analysis_params.get('target_conc_unit', 'UA'),
                         analysis_params.get('target_time_unit', 's'),
-                        analysis_params.get('enzyme_units')
+                        analysis_params.get('enzyme_units'),
+                        analysis_params.get('path_length_cm', 1.0)
                     )
                     
                     if result:
@@ -416,44 +366,6 @@ class BatchAnalyzer:
             logger.error(f"Critical error in batch analysis: {str(e)}")
             st.error(f"❌ **Critical Batch Analysis Error**: {str(e)}")
             return {}
-    
-    def suggest_time_frame(self, datasets: List[str]) -> Optional[Tuple[float, float]]:
-        """
-        Suggest an optimal time frame that works for all datasets.
-        Returns None if no common time frame is found.
-        """
-        if not datasets:
-            return None
-        
-        try:
-            # Find the intersection of all dataset time ranges
-            common_start = float('-inf')
-            common_end = float('inf')
-            
-            for dataset_name in datasets:
-                if dataset_name not in st.session_state.data_sets:
-                    continue
-                
-                data = st.session_state.data_sets[dataset_name]
-                data_start = data['time'].min()
-                data_end = data['time'].max()
-                
-                common_start = max(common_start, data_start)
-                common_end = min(common_end, data_end)
-            
-            if common_start < common_end and common_start != float('-inf'):
-                # Suggest a time frame that covers the middle 80% of the common range
-                time_range = common_end - common_start
-                suggested_start = common_start + (time_range * 0.1)
-                suggested_end = common_end - (time_range * 0.1)
-                
-                return (suggested_start, suggested_end)
-            else:
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error suggesting time frame: {str(e)}")
-            return None
 
 class ErrorHandler:
     """Centralized error handling with user-friendly messages."""
@@ -494,9 +406,6 @@ class EnzymeKineticsStreamlit:
     """
     
     def __init__(self):
-        self.ureg = pint.UnitRegistry()
-        self._define_custom_units()
-        
         # Initialize enhanced components
         self.color_palette = ColorPalette()
         self.avaspec_integration = AvaSpecIntegration()
@@ -566,14 +475,6 @@ class EnzymeKineticsStreamlit:
             "Fact: DNA repair enzymes fix about 1000 DNA damages per cell per day - busy little workers"
         ]
     
-    def _define_custom_units(self) -> None:
-        """Define custom units for biochemical applications."""
-        try:
-            self.ureg.define('enzyme_unit = 1 * umol / minute = EU')
-            self.ureg.define('international_unit = 1 * umol / minute = IU')
-        except Exception:
-            pass
-    
     def _get_plot_width(self) -> int:
         """Get plot width based on user selection."""
         width_mode = st.session_state.get('plot_width_mode', 'container')
@@ -611,11 +512,11 @@ class EnzymeKineticsStreamlit:
                         
                         col1, col2 = st.columns(2)
                         with col1:
-                            if st.button(f"Yes, convert.", key=f"convert_{uploaded_file.name}"):
+                            if st.button("Yes, convert.", key=f"convert_{uploaded_file.name}"):
                                 st.session_state[f"avaspec_prompt_{uploaded_file.name}"] = "convert"
                                 st.rerun()
                         with col2:
-                            if st.button(f"No.", key=f"standard_{uploaded_file.name}"):
+                            if st.button("No.", key=f"standard_{uploaded_file.name}"):
                                 st.session_state[f"avaspec_prompt_{uploaded_file.name}"] = "standard"
                                 st.rerun()
                         
@@ -659,32 +560,12 @@ class EnzymeKineticsStreamlit:
             return None
     
     def _load_txt_file(self, uploaded_file) -> pd.DataFrame:
-        """Load data from TXT file."""
-        content = uploaded_file.getvalue().decode('utf-8')
-        lines = content.strip().split('\n')
-        
-        # Skip comment lines and find header
-        data_start = 0
-        for i, line in enumerate(lines):
-            if line.strip().startswith('#') or line.strip().startswith('%'):
-                continue
-            if any(keyword in line.lower() for keyword in ['time', 'ua', 'concentration']):
-                data_start = i
-                break
-            if i > 10:  # Assume data starts within first 10 lines
-                data_start = i
-                break
-        
-        # Read data
-        data_lines = lines[data_start:]
-        df = pd.read_csv(io.StringIO('\n'.join(data_lines)), sep='\t', comment='#')
-        
-        return self._standardize_columns(df)
+        """Load data from a TXT file (any common separator, comments, decimal commas)."""
+        return kinetics_core.read_text_table(kinetics_core.decode_text(uploaded_file.getvalue()))
     
     def _load_csv_file(self, uploaded_file) -> pd.DataFrame:
-        """Load data from CSV file."""
-        df = pd.read_csv(uploaded_file)
-        return self._standardize_columns(df)
+        """Load data from a CSV file, including ';'-separated decimal-comma exports."""
+        return kinetics_core.read_text_table(kinetics_core.decode_text(uploaded_file.getvalue()))
     
     def _load_excel_file(self, uploaded_file) -> pd.DataFrame:
         """Load data from Excel file."""
@@ -693,42 +574,7 @@ class EnzymeKineticsStreamlit:
     
     def _standardize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """Standardize column names for consistent processing."""
-        # Create a mapping of possible column names to standard names
-        time_keywords = ['time', 'tiempo', 'temp', 'seconds', 'sec', 's']
-        concentration_keywords = ['ua', 'concentration', 'conc', 'product', 'absorbance', 'abs']
-        
-        # Find time column
-        time_col = None
-        for col in df.columns:
-            if any(keyword in str(col).lower() for keyword in time_keywords):
-                time_col = col
-                break
-        
-        # Find concentration column
-        conc_col = None
-        for col in df.columns:
-            if any(keyword in str(col).lower() for keyword in concentration_keywords):
-                conc_col = col
-                break
-        
-        if time_col is None or conc_col is None:
-            # Use first two numeric columns if keywords not found
-            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-            if len(numeric_cols) >= 2:
-                time_col = numeric_cols[0]
-                conc_col = numeric_cols[1]
-            else:
-                raise ValueError("Could not identify time and concentration columns")
-        
-        # Standardize column names
-        result_df = pd.DataFrame()
-        result_df['time'] = pd.to_numeric(df[time_col], errors='coerce')
-        result_df['product'] = pd.to_numeric(df[conc_col], errors='coerce')
-        
-        # Remove rows with NaN values
-        result_df = result_df.dropna()
-        
-        return result_df
+        return kinetics_core.standardize_columns(df)
     
     def _create_interactive_plot(self, dataset_name: str = None, show_regions: bool = True, overlay_datasets: List[str] = None) -> go.Figure:
         """Create interactive Plotly figure with enhanced color management."""
@@ -738,16 +584,14 @@ class EnzymeKineticsStreamlit:
         current_palette_type = st.session_state.get('color_palette_type', 'viridis')
         
         # Theme-aware styling
-        if hasattr(st.session_state, 'theme') and st.session_state.theme == 'dark':
+        if self._is_dark_theme():
             plot_bg = '#0e1117'
             paper_bg = '#0e1117'
-            grid_color = '#2a2e3b'
             text_color = '#ffffff'
             line_color = '#4a5568'
         else:
             plot_bg = 'white'
             paper_bg = 'white' 
-            grid_color = '#e2e8f0'
             text_color = '#2d3748'
             line_color = '#cbd5e0'
         
@@ -770,7 +614,8 @@ class EnzymeKineticsStreamlit:
                 colors.append(palette[color_idx][0])  # Get hex color
         else:
             # Use automatic color selection
-            colors = self.color_palette.select_colors(len(datasets_to_plot), current_palette_type)
+            colors = self.color_palette.select_colors(len(datasets_to_plot), current_palette_type,
+                                                      dark=self._is_dark_theme())
         
         # Add data traces
         for i, ds_name in enumerate(datasets_to_plot):
@@ -806,9 +651,7 @@ class EnzymeKineticsStreamlit:
         # Add current selection highlight
         if hasattr(st.session_state, 'selected_start') and hasattr(st.session_state, 'selected_end'):
             if 'selected_start' in st.session_state and 'selected_end' in st.session_state:
-                all_data = [st.session_state.data_sets[ds] for ds in datasets_to_plot]
-                y_min = min(data['product'].min() for data in all_data) * 0.95
-                y_max = max(data['product'].max() for data in all_data) * 1.05
+                y_min, y_max = self._padded_y_range(datasets_to_plot, 0.05)
                 
                 selection_color = '#6cce5a'  # Viridis green
                 fig.add_shape(
@@ -817,14 +660,14 @@ class EnzymeKineticsStreamlit:
                     y0=y_min,
                     x1=st.session_state.selected_end,
                     y1=y_max,
-                    fillcolor=f'rgba(108, 206, 90, 0.2)',
+                    fillcolor='rgba(108, 206, 90, 0.2)',
                     line=dict(color=selection_color, width=2, dash='dash'),
                     layer="below"
                 )
                 
                 fig.add_annotation(
                     x=(st.session_state.selected_start + st.session_state.selected_end) / 2,
-                    y=y_max * 0.98,
+                    y=y_max,
                     text=f"Selected: {st.session_state.selected_start:.1f}s - {st.session_state.selected_end:.1f}s",
                     showarrow=False,
                     font=dict(size=12, color=selection_color),
@@ -834,99 +677,27 @@ class EnzymeKineticsStreamlit:
                 )
         
         # Add region highlights if available
-        if show_regions and hasattr(st.session_state, 'regions'):
-            # Calculate global min/max for consistent shading
-            all_data = [st.session_state.data_sets[ds] for ds in datasets_to_plot]
-            global_min = min(data['product'].min() for data in all_data)
-            global_max = max(data['product'].max() for data in all_data)
-            
+        if show_regions and datasets_to_plot:
             if dataset_name:
-                # Single dataset mode - show regions for selected dataset
-                if dataset_name in st.session_state.regions:
-                    for region_name, region_data in st.session_state.regions[dataset_name].items():
-                        if 'start' in region_data and 'end' in region_data:
-                            data = st.session_state.data_sets[dataset_name]
-                            
-                            # Add shaded region background
-                            fig.add_shape(
-                                type="rect",
-                                x0=region_data['start'],
-                                y0=global_min * 0.98,
-                                x1=region_data['end'],
-                                y1=global_max * 1.02,
-                                fillcolor='rgba(128, 128, 128, 0.1)',
-                                line_width=0,
-                            )
-                            
-                            # Add fitted line if slope exists
-                            if 'slope' in region_data and 'intercept' in region_data:
-                                region_subset = data[
-                                    (data['time'] >= region_data['start']) & 
-                                    (data['time'] <= region_data['end'])
-                                ]
-                                if not region_subset.empty:
-                                    fitted_y = region_data['slope'] * region_subset['time'] + region_data['intercept']
-                                    # Get the color for this dataset
-                                    dataset_color = colors[datasets_to_plot.index(dataset_name)] if dataset_name in datasets_to_plot else colors[0]
-                                    # Add glow effect with wider transparent line first
-                                    fig.add_trace(go.Scatter(
-                                        x=region_subset['time'],
-                                        y=fitted_y,
-                                        mode='lines',
-                                        line=dict(width=st.session_state.get('plot_line_width', 5)*2, color=f'rgba({int(dataset_color[1:3], 16)}, {int(dataset_color[3:5], 16)}, {int(dataset_color[5:7], 16)}, 0.2)'),
-                                        hoverinfo='skip',
-                                        showlegend=False
-                                    ))
-                                    # Add main line
-                                    fig.add_trace(go.Scatter(
-                                        x=region_subset['time'],
-                                        y=fitted_y,
-                                        mode='lines',
-                                        name=f'{region_name} fit',
-                                        line=dict(width=st.session_state.get('plot_line_width', 5), color=dataset_color),
-                                        opacity=st.session_state.get('plot_line_opacity', 1.0),
-                                        hovertemplate='Fit: %{y:.3f}<extra></extra>',
-                                        showlegend=False
-                                    ))
+                # Single dataset mode: shaded regions plus fitted lines
+                shade_min, shade_max = self._padded_y_range(datasets_to_plot, 0.02)
+                dataset_color = colors[datasets_to_plot.index(dataset_name)] if dataset_name in datasets_to_plot else colors[0]
+                for region_name, region_data in st.session_state.regions.get(dataset_name, {}).items():
+                    fig.add_shape(
+                        type="rect",
+                        x0=region_data['start'], x1=region_data['end'],
+                        y0=shade_min, y1=shade_max,
+                        fillcolor='rgba(128, 128, 128, 0.1)',
+                        line_width=0,
+                    )
+                    self._add_fit_line(fig, dataset_name, region_name, region_data, dataset_color)
             else:
-                # Overlay mode - show regression lines without background shading
+                # Overlay mode: fitted lines only, coloured like their dataset
                 for dataset_idx, ds_name in enumerate(datasets_to_plot):
-                    if ds_name in st.session_state.regions:
-                        # Get the correct color for this dataset
-                        dataset_color = colors[dataset_idx % len(colors)]
-                        
-                        for region_name, region_data in st.session_state.regions[ds_name].items():
-                            if 'start' in region_data and 'end' in region_data:
-                                # Add fitted line if slope exists
-                                if 'slope' in region_data and 'intercept' in region_data:
-                                    data = st.session_state.data_sets[ds_name]
-                                    region_subset = data[
-                                        (data['time'] >= region_data['start']) & 
-                                        (data['time'] <= region_data['end'])
-                                    ]
-                                    if not region_subset.empty:
-                                        fitted_y = region_data['slope'] * region_subset['time'] + region_data['intercept']
-                                        # Add glow effect with wider transparent line first
-                                        fig.add_trace(go.Scatter(
-                                            x=region_subset['time'],
-                                            y=fitted_y,
-                                            mode='lines',
-                                            line=dict(width=st.session_state.get('plot_line_width', 5)*2, color=f'rgba({int(dataset_color[1:3], 16)}, {int(dataset_color[3:5], 16)}, {int(dataset_color[5:7], 16)}, 0.2)'),
-                                            hoverinfo='skip',
-                                            showlegend=False
-                                        ))
-                                        # Add main line
-                                        fig.add_trace(go.Scatter(
-                                            x=region_subset['time'],
-                                            y=fitted_y,
-                                            mode='lines',
-                                            name=f'{ds_name} - {region_name} fit',
-                                            line=dict(width=st.session_state.get('plot_line_width', 5), color=dataset_color),
-                                            opacity=st.session_state.get('plot_line_opacity', 1.0),
-                                            hovertemplate=f'{ds_name} fit: %{{y:.3f}}<extra></extra>',
-                                            showlegend=False,  # Don't show fit lines in legend
-                                            legendgroup=ds_name  # Group with dataset
-                                        ))
+                    dataset_color = colors[dataset_idx % len(colors)]
+                    for region_name, region_data in st.session_state.regions.get(ds_name, {}).items():
+                        self._add_fit_line(fig, ds_name, region_name, region_data, dataset_color,
+                                           label=f"{ds_name} fit")
         
         layout_config = dict(
             xaxis=dict(
@@ -980,204 +751,164 @@ class EnzymeKineticsStreamlit:
         fig.update_layout(layout_config)
         return fig
     
-    def _calculate_slope(self, dataset_name: str, start_time: float, end_time: float, region_name: str, 
-                        extinction_coeff: float = None, target_conc_unit: str = 'UA', 
-                        target_time_unit: str = 's', enzyme_units: Dict = None) -> Dict:
-        """Calculate slope for selected region."""
-        if dataset_name not in st.session_state.data_sets:
-            return {}
-        
-        data = st.session_state.data_sets[dataset_name]
-        
-        # Filter data for selected region
-        region_data = data[
-            (data['time'] >= start_time) & 
-            (data['time'] <= end_time)
-        ].copy()
-        
-        if len(region_data) < 2:
-            return {}
-        
-        # Perform linear regression
-        slope, intercept, r_value, _, std_err = stats.linregress(
-            region_data['time'], region_data['product']
-        )
-        
-        # Calculate additional statistics
-        n = len(region_data)
-        fitted_values = slope * region_data['time'] + intercept
-        residuals = region_data['product'] - fitted_values
-        rmse = np.sqrt(np.mean(residuals**2))
-        
-        # Calculate mean absorbance and standard deviation for the region
-        mean_absorbance = np.mean(region_data['product'])
-        absorbance_std_dev = np.std(region_data['product'], ddof=1)  # Sample standard deviation
-        
-        
-        # Convert slope using extinction coefficient if provided
-        converted_slope = slope
-        converted_std_err = std_err
-        slope_units = 'UA/s'
-        
-        if extinction_coeff and extinction_coeff > 0 and target_conc_unit != 'UA':
-            # Convert from absorbance/time to concentration/time
-            # slope is in AU/s, convert to mM/s or μM/s
-            if target_conc_unit == 'mM':
-                converted_slope = slope / extinction_coeff  # mM/s (assuming extinction coeff in mM⁻¹cm⁻¹)
-                converted_std_err = std_err / extinction_coeff  # Transform standard error too
-                slope_units = 'mM/s'
-            elif target_conc_unit == 'uM':
-                converted_slope = (slope / extinction_coeff) * 1000  # μM/s
-                converted_std_err = (std_err / extinction_coeff) * 1000  # Transform standard error too
-                slope_units = 'μM/s'
-        
-        # Convert time units if requested
-        if target_time_unit == 'min':
-            converted_slope *= 60  # per minute
-            converted_std_err *= 60  # Transform standard error too
-            slope_units = slope_units.replace('/s', '/min')
-        
-        # Convert to enzyme units if requested
-        enzyme_activity = None
-        enzyme_activity_units = None
-        if enzyme_units and enzyme_units.get('use_enzyme_units', False):
-            if target_conc_unit in ['mM', 'uM'] and target_time_unit == 'min':
-                # Convert concentration rate to enzyme activity
-                # 1 U = 1 μmol/min, so we need to convert to μmol/min first
-                if target_conc_unit == 'mM':
-                    # mM/min * reaction_volume_mL * 1000 μM/mM = μmol/min
-                    umol_per_min = converted_slope * enzyme_units['reaction_volume'] * 1000
-                elif target_conc_unit == 'uM':
-                    # μM/min * reaction_volume_mL = μmol/min  
-                    umol_per_min = converted_slope * enzyme_units['reaction_volume']
-                
-                # Convert to specific activity
-                if enzyme_units['enzyme_unit_type'] == 'U/mL':
-                    enzyme_activity = umol_per_min / enzyme_units['enzyme_volume']
-                    enzyme_activity_units = 'U/mL'
-                else:  # U/mg
-                    enzyme_activity = umol_per_min / enzyme_units['enzyme_mass']
-                    enzyme_activity_units = 'U/mg'
-        
-        return {
-            'region_name': region_name,
-            'dataset': dataset_name,
-            'start': start_time,
-            'end': end_time,
-            'slope': slope,  # Original slope in UA/s
-            'converted_slope': converted_slope,  # Converted slope
-            'slope_units': slope_units,
-            'extinction_coeff': extinction_coeff,
-            'intercept': intercept,
-            'r_squared': r_value**2,
-            'std_error': std_err,  # Original standard error
-            'converted_std_error': converted_std_err,  # Converted standard error
-            'enzyme_activity': enzyme_activity,  # Enzyme activity if calculated
-            'enzyme_activity_units': enzyme_activity_units,  # Enzyme activity units
-            'n_points': n,
-            'rmse': rmse,
-            'mean_absorbance': mean_absorbance,  # Mean absorbance in the region
-            'absorbance_std_dev': absorbance_std_dev  # Standard deviation of absorbance
-        }
-    
-    def _suggest_regions(self, dataset_name: str) -> Dict[str, Tuple[float, float]]:
-        """Suggest regions based on data analysis."""
-        if dataset_name not in st.session_state.data_sets:
-            return {}
-        
-        data = st.session_state.data_sets[dataset_name]
-        
-        # Simple suggestions: start, middle, end thirds
-        time_min = data['time'].min()
-        time_max = data['time'].max()
-        time_range = time_max - time_min
-        
-        suggestions = {
-            'Region 1': (time_min, time_min + time_range/3),
-            'Region 2': (time_min + time_range/3, time_min + 2*time_range/3),
-            'Region 3': (time_min + 2*time_range/3, time_max)
-        }
-        
-        return suggestions
-    
-    def _convert_units(self, value: float, from_unit: str, to_unit: str, unit_type: str = 'concentration') -> float:
-        """Convert units using pint unit registry."""
+    def _is_dark_theme(self) -> bool:
+        """Dark when chosen explicitly, or when 'auto' and the browser/Streamlit theme is dark."""
+        theme = st.session_state.get('theme', 'auto')
+        if theme != 'auto':
+            return theme == 'dark'
         try:
-            # Define unit mappings
-            if unit_type == 'concentration':
-                unit_mappings = {
-                    'UA': 'dimensionless',
-                    'uM': 'micromolar',
-                    'mM': 'millimolar', 
-                    'M': 'molar'
-                }
-            elif unit_type == 'time':
-                unit_mappings = {
-                    's': 'second',
-                    'min': 'minute',
-                    'h': 'hour'
-                }
-            else:
-                return value
-            
-            # Handle dimensionless units (UA)
-            if from_unit == 'UA' and to_unit == 'UA':
-                return value
-            elif from_unit == 'UA' or to_unit == 'UA':
-                # For UA conversions, just return the value as-is since it's relative
-                return value
-            
-            # Convert using pint
-            from_pint = unit_mappings.get(from_unit, from_unit)
-            to_pint = unit_mappings.get(to_unit, to_unit)
-            
-            quantity = self.ureg.Quantity(value, from_pint)
-            converted = quantity.to(to_pint)
-            return float(converted.magnitude)
-            
-        except Exception:
-            # If conversion fails, return original value
-            return value
+            return st.context.theme.type == 'dark'
+        except AttributeError:
+            return False
+
+    def _padded_y_range(self, dataset_names: List[str], fraction: float) -> Tuple[float, float]:
+        """Y range covering all plotted data, padded by a fraction of its span (works for negative values)."""
+        y_min = min(st.session_state.data_sets[ds]['product'].min() for ds in dataset_names)
+        y_max = max(st.session_state.data_sets[ds]['product'].max() for ds in dataset_names)
+        padding = (y_max - y_min) * fraction or abs(y_max) * fraction or fraction
+        return y_min - padding, y_max + padding
+
+    def _add_fit_line(self, fig: go.Figure, dataset_name: str, region_name: str, region_data: dict,
+                      color: str, label: str = "Fit") -> None:
+        """Draw a region's regression line with a soft glow underneath."""
+        data = st.session_state.data_sets[dataset_name]
+        region_subset = data[(data['time'] >= region_data['start']) & (data['time'] <= region_data['end'])]
+        if region_subset.empty:
+            return
+        fitted_y = region_data['slope'] * region_subset['time'] + region_data['intercept']
+        line_width = st.session_state.get('plot_line_width', 5)
+        red, green, blue = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+        fig.add_trace(go.Scatter(
+            x=region_subset['time'], y=fitted_y, mode='lines',
+            line=dict(width=line_width * 2, color=f'rgba({red}, {green}, {blue}, 0.2)'),
+            hoverinfo='skip', showlegend=False
+        ))
+        fig.add_trace(go.Scatter(
+            x=region_subset['time'], y=fitted_y, mode='lines',
+            name=f'{dataset_name} - {region_name} fit',
+            line=dict(width=line_width, color=color),
+            opacity=st.session_state.get('plot_line_opacity', 1.0),
+            hovertemplate=f'{label}: %{{y:.3f}}<extra></extra>',
+            showlegend=False, legendgroup=dataset_name
+        ))
+
+    def _calculate_slope(self, dataset_name: str, start_time: float, end_time: float, region_name: str,
+                        extinction_coeff: float = None, target_conc_unit: str = 'UA',
+                        target_time_unit: str = 's', enzyme_units: Dict = None,
+                        path_length_cm: float = 1.0) -> Dict:
+        """Calculate slope, unit conversions and enzyme activity for a region."""
+        if dataset_name not in st.session_state.data_sets:
+            return {}
+        result = kinetics_core.analyze_region(
+            st.session_state.data_sets[dataset_name], start_time, end_time,
+            extinction_coeff, target_conc_unit, target_time_unit, path_length_cm, enzyme_units)
+        if result is None:
+            return {}
+        return {'region_name': region_name, 'dataset': dataset_name, **result}
     
-    def _apply_unit_conversions(self, df: pd.DataFrame, time_unit_from: str, time_unit_to: str, 
-                               conc_unit_from: str, conc_unit_to: str) -> pd.DataFrame:
-        """Apply unit conversions to the dataframe."""
-        converted_df = df.copy()
-        
-        # Convert time units if different
-        if time_unit_from != time_unit_to and 'Start_Time' in converted_df.columns:
-            converted_df['Start_Time'] = converted_df['Start_Time'].apply(
-                lambda x: self._convert_units(float(x), time_unit_from, time_unit_to, 'time')
-            )
-            converted_df['End_Time'] = converted_df['End_Time'].apply(
-                lambda x: self._convert_units(float(x), time_unit_from, time_unit_to, 'time')
-            )
-        
-        # Convert concentration-related units
-        if conc_unit_from != conc_unit_to and 'Slope' in converted_df.columns:
-            # Slope units are concentration/time, so we need to convert the concentration part
-            converted_df['Slope'] = converted_df['Slope'].apply(
-                lambda x: self._convert_units(float(x), conc_unit_from, conc_unit_to, 'concentration')
-            )
-        
-        return converted_df
-    
-    def _create_download_link(self, df: pd.DataFrame, filename: str, 
-                             time_unit_from: str = 's', time_unit_to: str = 's',
-                             conc_unit_from: str = 'UA', conc_unit_to: str = 'UA') -> str:
-        """Create download link for DataFrame with unit conversion options."""
-        # Apply unit conversions if requested
-        if time_unit_from != time_unit_to or conc_unit_from != conc_unit_to:
-            df = self._apply_unit_conversions(df, time_unit_from, time_unit_to, conc_unit_from, conc_unit_to)
-        
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='Results')
-        
-        output.seek(0)
-        b64 = base64.b64encode(output.read()).decode()
-        return f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}" download="{filename}">Download {filename}</a>'
-    
+    def _format_region_for_display(self, region_data: dict) -> dict:
+        """Format region data for consistent display across individual and batch results."""
+        # Slope formatting
+        if 'converted_slope' in region_data and 'slope_units' in region_data:
+            slope_display = f"{region_data['converted_slope']:.4g}"
+            slope_units = region_data['slope_units']
+        else:
+            slope_display = f"{region_data['slope']:.4g}"
+            slope_units = 'UA/s'
+
+        # R-squared quality assessment
+        r_squared = region_data['r_squared']
+        if r_squared >= 0.99:
+            r_quality = 'excellent'
+        elif r_squared >= 0.98:
+            r_quality = 'warning'
+        else:
+            r_quality = 'poor'
+
+        # Standard error formatting
+        if 'converted_std_error' in region_data and region_data.get('converted_std_error') is not None:
+            std_err_display = f"{region_data['converted_std_error']:.3g}"
+        else:
+            std_err_display = f"{region_data.get('std_error', 0):.3g}"
+
+        return {
+            'slope_display': slope_display,
+            'slope_units': slope_units,
+            'slope_with_units': f"{slope_display} {slope_units}",
+            'r_squared': f"{r_squared:.4f}",
+            'r_quality': r_quality,
+            'time_range': self._format_time_range(region_data),
+            'n_points': region_data['n_points'],
+            'std_error': std_err_display,
+            'mean_abs': f"{region_data.get('mean_absorbance', 0):.4f}",
+            'abs_std': f"{region_data.get('absorbance_std_dev', 0):.4f}",
+            'enzyme_activity': region_data.get('enzyme_activity'),
+            'enzyme_units': region_data.get('enzyme_activity_units'),
+            'enzyme_activity_std_error': region_data.get('enzyme_activity_std_error')
+        }
+
+    @staticmethod
+    def _format_time_range(region_data: dict) -> str:
+        """Region time window in the same time unit as its slope."""
+        if region_data.get('slope_units', '').endswith('/min'):
+            return f"{region_data['start'] / 60:.2f}–{region_data['end'] / 60:.2f} min"
+        return f"{region_data['start']:.2f}–{region_data['end']:.2f} s"
+
+    def _display_region_result(self, region_name: str, region_data: dict,
+                                delete_key: str, show_dataset: bool = False,
+                                dataset_name: str = None) -> bool:
+        """Display a single region result as a structured card. Returns True if delete was clicked."""
+        formatted = self._format_region_for_display(region_data)
+
+        with st.container(border=True):
+            # Header row with region name, time range, and delete button
+            header_col, delete_col = st.columns([6, 1])
+            with header_col:
+                title = f"**{region_name}**"
+                if show_dataset and dataset_name:
+                    title += f" ({dataset_name})"
+                st.markdown(title)
+                st.caption(f"{formatted['time_range']} | {formatted['n_points']} points")
+
+            with delete_col:
+                delete_clicked = st.button("🗑️", key=delete_key, help=f"Delete {region_name}", type="secondary")
+
+            # Metrics row
+            col1, col2, col3, col4 = st.columns(4)
+
+            with col1:
+                st.metric(f"Slope ({formatted['slope_units']})", formatted['slope_display'],
+                          help=f"± {formatted['std_error']} {formatted['slope_units']} (standard error)")
+
+            with col2:
+                r_val = region_data['r_squared']
+                if r_val >= 0.99:
+                    delta = "Excellent"
+                    delta_color = "normal"
+                elif r_val < 0.98:
+                    delta = "Poor"
+                    delta_color = "inverse"
+                else:
+                    delta = None
+                    delta_color = "off"
+                st.metric("R²", formatted['r_squared'], delta=delta, delta_color=delta_color)
+
+            with col3:
+                st.metric("Mean Abs. (UA)", formatted['mean_abs'], help=f"± {formatted['abs_std']} UA (SD)")
+
+            with col4:
+                if formatted['enzyme_activity'] is not None:
+                    activity_help = formatted['enzyme_units']
+                    if formatted['enzyme_activity_std_error'] is not None:
+                        activity_help += f" (± {formatted['enzyme_activity_std_error']:.4f} SE)"
+                    st.metric(f"Activity ({formatted['enzyme_units']})",
+                              f"{formatted['enzyme_activity']:.4f}", help=activity_help)
+                else:
+                    st.metric(f"Std Error ({formatted['slope_units']})", formatted['std_error'])
+
+
+        return delete_clicked
+
     def _generate_txt_content(self, dataset_name: str, original_filename: str) -> str:
         """Generate TXT file content for converted AvaSpec data."""
         if dataset_name not in st.session_state.data_sets:
@@ -1191,7 +922,7 @@ class EnzymeKineticsStreamlit:
         txt_content.append("# DATA EXPORT AND TRANSFORMATION REPORT")
         txt_content.append("#")
         txt_content.append(f"# Original File: {original_filename}")
-        txt_content.append(f"# Converted by: Kinetics Analyzer v1")
+        txt_content.append(f"# Converted by: Kinetics Analyzer v{APP_VERSION}")
         txt_content.append(f"# Processing Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         txt_content.append("#")
         txt_content.append("# Operations Performed:")
@@ -1209,7 +940,6 @@ class EnzymeKineticsStreamlit:
     
     def _create_zip_download(self, converted_files: Dict[str, str], filename: str = "avaspec_converted_files.zip") -> bytes:
         """Create a ZIP file containing all converted TXT files."""
-        import zipfile
         
         zip_buffer = io.BytesIO()
         
@@ -1227,8 +957,141 @@ class EnzymeKineticsStreamlit:
         zip_buffer.seek(0)
         return zip_buffer.getvalue()
     
+    def _render_conversion_controls(self, key_prefix: str) -> Dict:
+        """Unit-conversion and enzyme-unit inputs, shared by single-region and batch analysis."""
+        st.markdown("**Unit Conversions (Optional)**")
+        col1, col2, col3, col4, col5 = st.columns(5)
+        with col1:
+            use_extinction = st.checkbox(
+                "Use Extinction Coefficient", value=False, key=f"{key_prefix}use_extinction",
+                help="Convert absorbance slope to concentration slope (Beer-Lambert)")
+        with col2:
+            extinction_coeff = st.number_input(
+                "ε (mM⁻¹cm⁻¹)", min_value=0.0, value=1.0, step=0.1, format="%.3f",
+                disabled=not use_extinction, key=f"{key_prefix}extinction_coeff",
+                help="Extinction coefficient in mM⁻¹cm⁻¹ (e.g. NADH at 340 nm: 6.22)")
+        with col3:
+            path_length_cm = st.number_input(
+                "Path length (cm)", min_value=0.001, value=1.0, step=0.1, format="%.3f",
+                disabled=not use_extinction, key=f"{key_prefix}path_length",
+                help="Optical path length of the cuvette or well")
+        with col4:
+            target_conc_unit = st.selectbox(
+                "Concentration Unit", ["mM", "uM"], index=1,
+                disabled=not use_extinction, key=f"{key_prefix}conc_unit",
+                help="Target concentration unit for the slope")
+        with col5:
+            target_time_unit = st.selectbox(
+                "Time Unit", ["s", "min"], index=0, key=f"{key_prefix}time_unit",
+                help="Time unit for the slope")
+
+        st.markdown("**Enzyme Unit Conversion**")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            use_enzyme_units = st.checkbox(
+                "Convert to Enzyme Units", value=False, key=f"{key_prefix}use_enzyme_units",
+                help="Convert the concentration rate to enzyme activity (1 U = 1 µmol/min)")
+        with col2:
+            enzyme_unit_type = st.selectbox(
+                "Enzyme Unit Type", ["U/mL", "U/mg"], index=0,
+                disabled=not use_enzyme_units, key=f"{key_prefix}enzyme_unit_type")
+        with col3:
+            reaction_volume = st.number_input(
+                "Reaction Volume (mL)", min_value=0.001, value=1.0, step=0.001, format="%.3f",
+                disabled=not use_enzyme_units, key=f"{key_prefix}reaction_volume",
+                help="Total reaction volume in mL")
+        with col4:
+            if enzyme_unit_type == "U/mL":
+                enzyme_amount = st.number_input(
+                    "Enzyme Volume (mL)", min_value=0.001, value=0.010, step=0.001, format="%.3f",
+                    disabled=not use_enzyme_units, key=f"{key_prefix}enzyme_volume",
+                    help="Volume of enzyme solution added, in mL")
+            else:
+                enzyme_amount = st.number_input(
+                    "Enzyme Mass (mg)", min_value=0.001, value=1.0, step=0.001, format="%.3f",
+                    disabled=not use_enzyme_units, key=f"{key_prefix}enzyme_mass",
+                    help="Mass of enzyme in the reaction, in mg")
+
+        if use_enzyme_units and not use_extinction:
+            st.info("ℹ️ Enzyme units need a concentration rate: turn on the extinction coefficient "
+                    "so the absorbance slope can be converted to mM or µM first.")
+
+        enzyme_units = None
+        if use_enzyme_units and use_extinction:
+            enzyme_units = {
+                'use_enzyme_units': True,
+                'enzyme_unit_type': enzyme_unit_type,
+                'reaction_volume': reaction_volume,
+                'enzyme_volume' if enzyme_unit_type == "U/mL" else 'enzyme_mass': enzyme_amount,
+            }
+
+        return {
+            'extinction_coeff': extinction_coeff if use_extinction else None,
+            'target_conc_unit': target_conc_unit if use_extinction else 'UA',
+            'target_time_unit': target_time_unit,
+            'path_length_cm': path_length_cm,
+            'enzyme_units': enzyme_units,
+        }
+
+    SESSION_SETTING_KEYS = ['theme', 'color_palette_type', 'color_mode', 'plot_marker_size',
+                            'plot_marker_opacity', 'plot_line_width', 'plot_line_opacity',
+                            'plot_height', 'plot_width_mode', 'plot_image_format']
+
+    def _render_session_controls(self) -> None:
+        """Sidebar controls to save the whole analysis to JSON and restore it later."""
+
+        if st.session_state.data_sets:
+            settings = {key: st.session_state[key] for key in self.SESSION_SETTING_KEYS
+                        if key in st.session_state}
+            settings['region_counter'] = st.session_state.get('region_counter', 0)
+            session_json = kinetics_core.session_to_json(
+                st.session_state.data_sets, st.session_state.regions, settings)
+            st.download_button(
+                "💾 Save session",
+                data=session_json,
+                file_name=f"kinetics_session_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                mime="application/json",
+                width="stretch",
+                help="Download all datasets, regions and settings as a JSON file"
+            )
+
+        session_file = st.file_uploader(
+            "📂 Load session", type=['json'], key="session_uploader",
+            help="Restore a session saved with 'Save session'")
+        if session_file is None:
+            return
+
+        file_id = (session_file.name, session_file.size)
+        if st.session_state.get('loaded_session_file') == file_id:
+            return
+
+        try:
+            data_sets, regions, settings = kinetics_core.session_from_json(
+                session_file.getvalue().decode('utf-8'))
+        except (ValueError, UnicodeDecodeError) as error:
+            st.error(f"❌ **Could not load session**: {error}")
+            return
+
+        st.session_state.data_sets.update(data_sets)
+        st.session_state.regions.update(regions)
+        st.session_state.session_loaded_datasets = (
+            st.session_state.get('session_loaded_datasets', set()) | set(data_sets))
+        for key, value in settings.items():
+            if key in self.SESSION_SETTING_KEYS:
+                st.session_state[key] = value
+        # New widget keys make the plot sliders pick up the restored values
+        st.session_state.plot_widgets_epoch = st.session_state.get('plot_widgets_epoch', 0) + 1
+        st.session_state.region_counter = max(st.session_state.get('region_counter', 0),
+                                              settings.get('region_counter', 0))
+        st.session_state.loaded_session_file = file_id
+        logger.info(f"Loaded session {session_file.name}: {len(data_sets)} datasets")
+        st.rerun()
+
     def run(self):
         """Main application interface with Phase 1 improvements."""
+        # ====================
+        # SECTION 1: Theme & CSS Setup
+        # ====================
         # Initialize theme preference
         if 'theme' not in st.session_state:
             st.session_state.theme = 'auto'
@@ -1334,15 +1197,25 @@ class EnzymeKineticsStreamlit:
         .coffee-loading {{
             animation: coffee-steam 2s ease-in-out infinite;
         }}
+
+        /* Keep result numbers readable in narrow columns */
+        [data-testid="stMetricValue"] {{
+            font-size: 1.6rem;
+        }}
         </style>
         """, unsafe_allow_html=True)
-        
+
+        # ====================
+        # SECTION 2: Header & Sidebar
+        # ====================
         # Professional header with same styling as original
-        selected_quote = random.choice(self.quotes)
+        if 'header_quote' not in st.session_state:
+            st.session_state.header_quote = random.choice(self.quotes)
+        selected_quote = st.session_state.header_quote
         st.markdown(f"""
         <div class="main-header">
             <h1>☕ Kinetics Analyzer</h1>
-            <p>Interactive enzyme kinetics data analysis</p>
+            <p>Interactive enzyme kinetics data analysis · v{APP_VERSION}</p>
             <div class="viridis-accent"></div>
             <div style="font-style: italic; opacity: 0.7; font-size: 0.9rem; margin-top: 0.5rem;">
                 "{selected_quote}"
@@ -1352,93 +1225,95 @@ class EnzymeKineticsStreamlit:
         
         # Sidebar configuration
         with st.sidebar:
-            st.header("Configuration")
+            with st.expander("🎨 Appearance", expanded=False):
             
-            # Theme selection
-            theme_option = st.selectbox(
-                "Theme",
-                ["auto", "light", "dark"],
-                index=0 if st.session_state.theme == 'auto' else (1 if st.session_state.theme == 'light' else 2),
-                help="Choose interface theme"
-            )
+                # Theme selection
+                theme_option = st.selectbox(
+                    "Theme",
+                    ["auto", "light", "dark"],
+                    index=0 if st.session_state.theme == 'auto' else (1 if st.session_state.theme == 'light' else 2),
+                    help="Choose interface theme"
+                )
             
-            if theme_option != st.session_state.theme:
-                st.session_state.theme = theme_option
-                st.rerun()
+                if theme_option != st.session_state.theme:
+                    st.session_state.theme = theme_option
+                    st.rerun()
             
-            # Enhanced color palette management with v1 improvements
-            st.subheader("Color Settings")
+                # Enhanced color palette management with v1 improvements
+                st.markdown("**Color Settings**")
             
-            # Color palette mode selection
-            color_palette_type = st.radio(
-                "Color Palette",
-                ["Viridis", "Nostalgic"],
-                index=0 if st.session_state.get('color_palette_type', 'viridis') == 'viridis' else 1,
-                help="Choose color palette style"
-            )
+                # Color palette mode selection
+                color_palette_type = st.radio(
+                    "Color Palette",
+                    ["Viridis", "Nostalgic"],
+                    index=0 if st.session_state.get('color_palette_type', 'viridis') == 'viridis' else 1,
+                    help="Choose color palette style"
+                )
             
-            # Store palette type
-            st.session_state.color_palette_type = 'viridis' if color_palette_type == "Viridis" else 'nostalgic'
+                # Store palette type
+                st.session_state.color_palette_type = 'viridis' if color_palette_type == "Viridis" else 'nostalgic'
             
-            # Get current palette using enhanced color management
-            current_palette = self.color_palette.get_palette(st.session_state.color_palette_type)
+                # Get current palette using enhanced color management
+                current_palette = self.color_palette.get_palette(st.session_state.color_palette_type)
             
-            # Color selection mode
-            color_mode = st.radio(
-                "Color Selection Mode",
-                ["Automatic (Dynamic)", "Manual Selection"],
-                index=0 if st.session_state.get('color_mode', 'auto') == 'auto' else 1,
-                help="Choose automatic color selection or manually pick colors"
-            )
+                # Color selection mode
+                color_mode = st.radio(
+                    "Color Selection Mode",
+                    ["Automatic (Dynamic)", "Manual Selection"],
+                    index=0 if st.session_state.get('color_mode', 'auto') == 'auto' else 1,
+                    help="Choose automatic color selection or manually pick colors"
+                )
             
-            # Store color mode and track changes
-            new_color_mode = 'auto' if color_mode == "Automatic (Dynamic)" else 'manual'
+                # Store color mode and track changes
+                new_color_mode = 'auto' if color_mode == "Automatic (Dynamic)" else 'manual'
             
-            # Track mode changes for color preservation
-            if 'color_mode' in st.session_state and st.session_state.color_mode != new_color_mode:
-                st.session_state.color_mode_previous = st.session_state.color_mode
+                # Track mode changes for color preservation
+                if 'color_mode' in st.session_state and st.session_state.color_mode != new_color_mode:
+                    st.session_state.color_mode_previous = st.session_state.color_mode
             
-            st.session_state.color_mode = new_color_mode
+                st.session_state.color_mode = new_color_mode
             
-            # Manual color selection with enhanced palette management
-            if st.session_state.color_mode == 'manual' and st.session_state.data_sets:
-                st.write("**Select colors for each dataset:**")
+                # Manual color selection with enhanced palette management
+                if st.session_state.color_mode == 'manual' and st.session_state.data_sets:
+                    st.write("**Select colors for each dataset:**")
                 
-                # Initialize manual colors if not exists
-                if 'manual_colors' not in st.session_state:
-                    st.session_state.manual_colors = {}
+                    # Initialize manual colors if not exists
+                    if 'manual_colors' not in st.session_state:
+                        st.session_state.manual_colors = {}
                 
-                # Simple color selector for each dataset
-                for i, dataset_name in enumerate(st.session_state.data_sets.keys()):
-                    col1, col2 = st.columns([3, 1])
-                    with col1:
-                        # Display color options with descriptive names from current palette
-                        selected_color_idx = st.selectbox(
-                            f"{dataset_name}:",
-                            range(len(current_palette)),
-                            index=st.session_state.manual_colors.get(dataset_name, i % len(current_palette)),
-                            format_func=lambda x: current_palette[x][1],  # Use descriptive name
-                            key=f"color_select_{dataset_name}_{st.session_state.color_palette_type}"
-                        )
-                        st.session_state.manual_colors[dataset_name] = selected_color_idx
+                    # Simple color selector for each dataset
+                    for i, dataset_name in enumerate(st.session_state.data_sets.keys()):
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            # Display color options with descriptive names from current palette
+                            selected_color_idx = st.selectbox(
+                                f"{dataset_name}:",
+                                range(len(current_palette)),
+                                index=st.session_state.manual_colors.get(dataset_name, i % len(current_palette)),
+                                format_func=lambda x: current_palette[x][1],  # Use descriptive name
+                                key=f"color_select_{dataset_name}_{st.session_state.color_palette_type}"
+                            )
+                            st.session_state.manual_colors[dataset_name] = selected_color_idx
                     
-                    with col2:
-                        # Show color preview
-                        color_hex = current_palette[selected_color_idx][0]  # Get hex color
-                        st.markdown(f"""
-                        <div style="
-                            width: 30px; 
-                            height: 30px; 
-                            background-color: {color_hex}; 
-                            border-radius: 4px; 
-                            border: 1px solid #ccc;
-                            margin-top: 24px;
-                        "></div>
-                        """, unsafe_allow_html=True)
+                        with col2:
+                            # Show color preview
+                            color_hex = current_palette[selected_color_idx][0]  # Get hex color
+                            st.markdown(f"""
+                            <div style="
+                                width: 30px; 
+                                height: 30px; 
+                                background-color: {color_hex}; 
+                                border-radius: 4px; 
+                                border: 1px solid #ccc;
+                                margin-top: 24px;
+                            "></div>
+                            """, unsafe_allow_html=True)
             
             st.divider()
-            
-            # Enhanced file upload with AvaSpec integration
+
+            # ====================
+            # SECTION 3: File Upload & Processing
+            # ====================
             st.header("Data Upload")
             
             uploaded_files = st.file_uploader(
@@ -1524,7 +1399,6 @@ class EnzymeKineticsStreamlit:
                                         st.success(f"📁 Loaded: {uploaded_file.name}")
                 
                 # Process remaining files (non-Excel and individual handling)
-                st.subheader("Loaded Files")
                 for uploaded_file in uploaded_files:
                     if uploaded_file.name not in st.session_state.data_sets:
                         # Skip Excel files that are part of batch processing (unless individual handling)
@@ -1539,128 +1413,139 @@ class EnzymeKineticsStreamlit:
                                 st.session_state.data_sets[uploaded_file.name] = data
                                 st.success(f"📁 Loaded: {uploaded_file.name}")
                             # Error already handled by error handler if data is None
-                    else:
-                        st.info(f"Already loaded: {uploaded_file.name}")
+                loaded_names = [f.name for f in uploaded_files if f.name in st.session_state.data_sets]
+                if loaded_names:
+                    st.caption(f"✅ {len(loaded_names)} file(s) loaded: {', '.join(loaded_names)}")
             else:
-                # Clear session state when no files
-                if st.session_state.data_sets:
-                    st.session_state.data_sets = {}
-                    st.session_state.regions = {}
-                    st.session_state.avaspec_converted_files = {}
-                    if hasattr(st.session_state, 'manual_colors'):
-                        st.session_state.manual_colors = {}
-            
+                # No files in the uploader: drop uploaded datasets, keep ones restored from a session file
+                self.memory_manager.cleanup_removed_datasets(set())
+
+            with st.expander("💾 Session", expanded=False):
+                self._render_session_controls()
+
             st.divider()
             
             # Plot customization section (same as original)
-            st.subheader("Plot Appearance")
+            with st.expander("📈 Plot Appearance", expanded=False):
             
-            # Initialize plot customization settings in session state
-            if 'plot_marker_size' not in st.session_state:
-                st.session_state.plot_marker_size = 3
-            if 'plot_marker_opacity' not in st.session_state:
-                st.session_state.plot_marker_opacity = 1.0
-            if 'plot_line_width' not in st.session_state:
-                st.session_state.plot_line_width = 5
-            if 'plot_line_opacity' not in st.session_state:
-                st.session_state.plot_line_opacity = 0.7
-            if 'plot_height' not in st.session_state:
-                st.session_state.plot_height = 500
-            if 'plot_width_mode' not in st.session_state:
-                st.session_state.plot_width_mode = 'container'
+                # Initialize plot customization settings in session state
+                if 'plot_marker_size' not in st.session_state:
+                    st.session_state.plot_marker_size = 3
+                if 'plot_marker_opacity' not in st.session_state:
+                    st.session_state.plot_marker_opacity = 1.0
+                if 'plot_line_width' not in st.session_state:
+                    st.session_state.plot_line_width = 5
+                if 'plot_line_opacity' not in st.session_state:
+                    st.session_state.plot_line_opacity = 0.7
+                if 'plot_height' not in st.session_state:
+                    st.session_state.plot_height = 500
+                if 'plot_width_mode' not in st.session_state:
+                    st.session_state.plot_width_mode = 'container'
             
-            # Data points customization
-            st.write("**Data Points:**")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.session_state.plot_marker_size = st.slider(
-                    "Thickness",
-                    min_value=1,
-                    max_value=10,
-                    value=st.session_state.plot_marker_size,
-                    step=1,
-                    key="marker_size_slider",
-                    help="Size of data point markers"
-                )
-            with col2:
-                st.session_state.plot_marker_opacity = st.slider(
-                    "Opacity",
-                    min_value=0.1,
-                    max_value=1.0,
-                    value=st.session_state.plot_marker_opacity,
-                    step=0.1,
-                    key="marker_opacity_slider",
-                    help="Opacity of data points (1.0 = opaque, 0.1 = very transparent)"
-                )
+                plot_widgets_epoch = st.session_state.get('plot_widgets_epoch', 0)
             
-            # Fitted lines customization
-            st.write("**Fitted Lines:**")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.session_state.plot_line_width = st.slider(
-                    "Thickness",
-                    min_value=1,
-                    max_value=10,
-                    value=st.session_state.plot_line_width,
-                    step=1,
-                    key="line_width_slider",
-                    help="Width of fitted regression lines"
-                )
-            with col2:
-                st.session_state.plot_line_opacity = st.slider(
-                    "Opacity",
-                    min_value=0.1,
-                    max_value=1.0,
-                    value=st.session_state.plot_line_opacity,
-                    step=0.1,
-                    key="line_opacity_slider",
-                    help="Opacity of fitted lines (1.0 = opaque, 0.1 = very transparent)"
-                )
+                # Data points customization
+                st.write("**Data Points:**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.session_state.plot_marker_size = st.slider(
+                        "Thickness",
+                        min_value=1,
+                        max_value=10,
+                        value=st.session_state.plot_marker_size,
+                        step=1,
+                        key=f"marker_size_slider_{plot_widgets_epoch}",
+                        help="Size of data point markers"
+                    )
+                with col2:
+                    st.session_state.plot_marker_opacity = st.slider(
+                        "Opacity",
+                        min_value=0.1,
+                        max_value=1.0,
+                        value=st.session_state.plot_marker_opacity,
+                        step=0.1,
+                        key=f"marker_opacity_slider_{plot_widgets_epoch}",
+                        help="Opacity of data points (1.0 = opaque, 0.1 = very transparent)"
+                    )
             
-            # Plot size customization
-            st.write("**Plot Size:**")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.session_state.plot_height = st.slider(
-                    "Height (px)",
-                    min_value=300,
-                    max_value=1000,
-                    value=st.session_state.plot_height,
-                    step=50,
-                    key="plot_height_slider",
-                    help="Height of the plot in pixels"
-                )
-            with col2:
-                plot_width_options = ["Container Width", "Small (600px)", "Medium (800px)", "Large (1000px)", "Extra Large (1200px)"]
-                width_mode_index = ["container", "small", "medium", "large", "xlarge"].index(st.session_state.plot_width_mode)
+                # Fitted lines customization
+                st.write("**Fitted Lines:**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.session_state.plot_line_width = st.slider(
+                        "Thickness",
+                        min_value=1,
+                        max_value=10,
+                        value=st.session_state.plot_line_width,
+                        step=1,
+                        key=f"line_width_slider_{plot_widgets_epoch}",
+                        help="Width of fitted regression lines"
+                    )
+                with col2:
+                    st.session_state.plot_line_opacity = st.slider(
+                        "Opacity",
+                        min_value=0.1,
+                        max_value=1.0,
+                        value=st.session_state.plot_line_opacity,
+                        step=0.1,
+                        key=f"line_opacity_slider_{plot_widgets_epoch}",
+                        help="Opacity of fitted lines (1.0 = opaque, 0.1 = very transparent)"
+                    )
+            
+                # Plot size customization
+                st.write("**Plot Size:**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.session_state.plot_height = st.slider(
+                        "Height (px)",
+                        min_value=300,
+                        max_value=1000,
+                        value=st.session_state.plot_height,
+                        step=50,
+                        key=f"plot_height_slider_{plot_widgets_epoch}",
+                        help="Height of the plot in pixels"
+                    )
+                with col2:
+                    plot_width_options = ["Container Width", "Small (600px)", "Medium (800px)", "Large (1000px)", "Extra Large (1200px)"]
+                    width_mode_index = ["container", "small", "medium", "large", "xlarge"].index(st.session_state.plot_width_mode)
                 
-                selected_width = st.selectbox(
-                    "Width",
-                    plot_width_options,
-                    index=width_mode_index,
-                    key="plot_width_selector",
-                    help="Width of the plot"
+                    selected_width = st.selectbox(
+                        "Width",
+                        plot_width_options,
+                        index=width_mode_index,
+                        key=f"plot_width_selector_{plot_widgets_epoch}",
+                        help="Width of the plot"
+                    )
+                
+                    # Update session state based on selection
+                    width_mapping = {
+                        "Container Width": "container",
+                        "Small (600px)": "small", 
+                        "Medium (800px)": "medium",
+                        "Large (1000px)": "large",
+                        "Extra Large (1200px)": "xlarge"
+                    }
+                    st.session_state.plot_width_mode = width_mapping[selected_width]
+            
+                st.session_state.plot_image_format = st.selectbox(
+                    "Image download (📷 button)",
+                    ["png", "svg"],
+                    index=["png", "svg"].index(st.session_state.get('plot_image_format', 'png')),
+                    format_func=lambda fmt: {"png": "PNG (high resolution)", "svg": "SVG (vector)"}[fmt],
+                    key=f"plot_image_format_{plot_widgets_epoch}",
+                    help="Format used by the camera button in the plot toolbar"
                 )
                 
-                # Update session state based on selection
-                width_mapping = {
-                    "Container Width": "container",
-                    "Small (600px)": "small", 
-                    "Medium (800px)": "medium",
-                    "Large (1000px)": "large",
-                    "Extra Large (1200px)": "xlarge"
-                }
-                st.session_state.plot_width_mode = width_mapping[selected_width]
-            
-            # Reset to defaults button
-            if st.button("Reset to Defaults", type="secondary", use_container_width=True):
-                st.session_state.plot_marker_size = 3
-                st.session_state.plot_marker_opacity = 1.0
-                st.session_state.plot_line_width = 5
-                st.session_state.plot_line_opacity = 0.7
-                st.session_state.plot_height = 500
-                st.session_state.plot_width_mode = 'container'
-                st.rerun()
+                # Reset to defaults button
+                if st.button("Reset to Defaults", type="secondary", width="stretch"):
+                    st.session_state.plot_marker_size = 3
+                    st.session_state.plot_marker_opacity = 1.0
+                    st.session_state.plot_line_width = 5
+                    st.session_state.plot_line_opacity = 0.7
+                    st.session_state.plot_height = 500
+                    st.session_state.plot_width_mode = 'container'
+                    st.session_state.plot_widgets_epoch = plot_widgets_epoch + 1
+                    st.rerun()
             
             st.divider()
             
@@ -1696,7 +1581,7 @@ class EnzymeKineticsStreamlit:
                         data=zip_data,
                         file_name="avaspec_converted_files.zip",
                         mime="application/zip",
-                        use_container_width=True,
+                        width="stretch",
                         type="primary",
                         help=f"Download {converted_count} converted AvaSpec files as TXT format in a ZIP file"
                     )
@@ -1713,10 +1598,13 @@ class EnzymeKineticsStreamlit:
             
         # Main content area
         if not st.session_state.data_sets:
-            st.info("Please upload data files using the sidebar to begin analysis.")
+            st.markdown("### Welcome")
+            st.info("Upload your kinetics data (TXT, CSV, or Excel) using the sidebar to get started.")
             return
-        
-        # Dataset selection and overlay options
+
+        # ====================
+        # SECTION 4: Dataset Selection & Overlay
+        # ====================
         st.subheader("Dataset Analysis")
         
         selected_dataset = st.selectbox(
@@ -1784,7 +1672,7 @@ class EnzymeKineticsStreamlit:
                                 "Batch Start Time (s)",
                                 min_value=float(all_data_min),
                                 max_value=float(all_data_max),
-                                value=float(st.session_state.selected_start),
+                                value=_clamp(st.session_state.selected_start, all_data_min, all_data_max),
                                 step=0.1,
                                 format="%.2f",
                                 key="batch_start_time",
@@ -1795,7 +1683,7 @@ class EnzymeKineticsStreamlit:
                                 "Batch End Time (s)",
                                 min_value=float(max(batch_start, all_data_min)),
                                 max_value=float(all_data_max),
-                                value=float(st.session_state.selected_end),
+                                value=_clamp(st.session_state.selected_end, max(batch_start, all_data_min), all_data_max),
                                 step=0.1,
                                 format="%.2f",
                                 key="batch_end_time",
@@ -1814,56 +1702,12 @@ class EnzymeKineticsStreamlit:
                     
                     # Only show batch analysis parameters if there's a selection
                     if has_interactive_selection:
-                        # Batch analysis parameters (simplified)
                         st.write("**Batch Analysis Parameters:**")
-                        batch_col1, batch_col2 = st.columns(2)
-                        
-                        with batch_col1:
-                            batch_use_extinction = st.checkbox(
-                                "Use Extinction Coefficient (Batch)",
-                                value=False,
-                                key="batch_extinction",
-                                help="Apply extinction coefficient to all datasets in batch"
-                            )
-                            
-                            batch_extinction_coeff = st.number_input(
-                                "Extinction Coefficient (Batch)",
-                                min_value=0.0,
-                                value=1.0,
-                                step=0.1,
-                                format="%.3f",
-                                disabled=not batch_use_extinction,
-                                key="batch_extinction_value",
-                                help="Extinction coefficient for batch analysis"
-                            )
-                        
-                        with batch_col2:
-                            batch_conc_unit = st.selectbox(
-                                "Concentration Unit (Batch)",
-                                ["UA", "mM", "uM"],
-                                index=0,
-                                disabled=not batch_use_extinction,
-                                key="batch_conc_unit",
-                                help="Target concentration unit for batch analysis"
-                            )
-                            
-                            batch_time_unit = st.selectbox(
-                                "Time Unit (Batch)",
-                                ["s", "min"],
-                                index=0,
-                                key="batch_time_unit",
-                                help="Time unit for batch analysis"
-                            )
+                        batch_conversion = self._render_conversion_controls(key_prefix="batch_")
                         
                         # Run batch analysis button
-                        if st.button("Run Batch Analysis", type="primary", use_container_width=True):
-                            # Prepare batch analysis parameters
-                            batch_params = {
-                                'extinction_coeff': batch_extinction_coeff if batch_use_extinction else None,
-                                'target_conc_unit': batch_conc_unit if batch_use_extinction else 'UA',
-                                'target_time_unit': batch_time_unit,
-                                'enzyme_units': None  # Can be extended later
-                            }
+                        if st.button("Run Batch Analysis", type="primary", width="stretch"):
+                            batch_params = batch_conversion
                             
                             # Run safe batch analysis
                             batch_results = self.batch_analyzer.perform_batch_analysis(
@@ -1884,8 +1728,10 @@ class EnzymeKineticsStreamlit:
             st.subheader("Batch Analysis")
             st.info("💡 Enable overlay mode above to access batch processing features.")
         
+        # ====================
+        # SECTION 5: Interactive Plot
+        # ====================
         if selected_dataset:
-            # Display plot
             st.subheader("Interactive Data Visualization")
             
             # Clear selection option
@@ -1901,6 +1747,11 @@ class EnzymeKineticsStreamlit:
             config = {
                 'modeBarButtonsToRemove': ['lasso2d'],
                 'displayModeBar': True,
+                'toImageButtonOptions': {
+                    'format': st.session_state.get('plot_image_format', 'png'),
+                    'filename': Path(selected_dataset).stem if not (show_overlay and overlay_datasets) else 'kinetics_overlay',
+                    'scale': 3,
+                },
                 'displaylogo': False,
                 'modeBarButtonsToAdd': ['select2d'],
                 'showTips': True,
@@ -1923,9 +1774,9 @@ class EnzymeKineticsStreamlit:
                 unique_plot_key = f"{plot_key}_{selected_dataset}"
             
             # Determine if we should use container width or fixed width
-            use_container_width = st.session_state.get('plot_width_mode', 'container') == 'container'
+            chart_width = "stretch" if st.session_state.get('plot_width_mode', 'container') == 'container' else "content"
             
-            plot_selection = st.plotly_chart(fig, use_container_width=use_container_width, key=unique_plot_key, on_select="rerun", config=config)
+            plot_selection = st.plotly_chart(fig, width=chart_width, key=unique_plot_key, on_select="rerun", config=config)
             
             # Handle plot selection events
             if plot_selection and 'selection' in plot_selection and plot_selection['selection']:
@@ -1943,15 +1794,26 @@ class EnzymeKineticsStreamlit:
                         st.session_state.selection_counter = st.session_state.get('selection_counter', 0) + 1
                         st.rerun()
             
-            # Display current selection
+            # Display current selection, with a one-click way to analyze it
+            quick_add = False
             if 'selected_start' in st.session_state and 'selected_end' in st.session_state:
                 target_dataset = st.session_state.get('selected_for_dataset', 'Unknown')
                 if target_dataset == selected_dataset:
-                    st.info(f"Selected for {selected_dataset}: {st.session_state.selected_start:.2f}s to {st.session_state.selected_end:.2f}s")
+                    data_times = st.session_state.data_sets[selected_dataset]['time']
+                    shown_start = _clamp(st.session_state.selected_start, data_times.min(), data_times.max())
+                    shown_end = _clamp(st.session_state.selected_end, data_times.min(), data_times.max())
+                    info_col, button_col = st.columns([3, 1], vertical_alignment="center")
+                    with info_col:
+                        st.info(f"Selected on {selected_dataset}: {shown_start:.2f} s to {shown_end:.2f} s")
+                    with button_col:
+                        quick_add = st.button("➕ Add region from selection", type="primary", width="stretch",
+                                              help="Analyze the selection now, using the conversion settings below")
                 else:
                     st.warning(f"Selection is for {target_dataset}, currently viewing {selected_dataset}. Switch datasets to use selection.")
             
-            # Region management with enhanced interface
+            # ====================
+            # SECTION 6: Region Analysis
+            # ====================
             st.subheader("Region Analysis")
             
             # Initialize regions for this dataset if not exists
@@ -1972,7 +1834,7 @@ class EnzymeKineticsStreamlit:
                                    st.session_state.get('selected_for_dataset') == selected_dataset)
                     
                     if has_selection:
-                        default_start = st.session_state.selected_start
+                        default_start = _clamp(st.session_state.selected_start, data_min, data_max)
                     else:
                         default_start = data_min
                     
@@ -1989,7 +1851,7 @@ class EnzymeKineticsStreamlit:
                 
                 with col2:
                     if has_selection:
-                        default_end = max(st.session_state.selected_end, new_start)
+                        default_end = _clamp(st.session_state.selected_end, new_start, data_max)
                     else:
                         default_end = data_max
                     
@@ -2005,128 +1867,27 @@ class EnzymeKineticsStreamlit:
                     )
                 
                 with col3:
+                    existing_names = st.session_state.regions[selected_dataset]
+                    next_number = st.session_state.region_counter + 1
+                    while f"Region_{next_number}" in existing_names:
+                        next_number += 1
                     region_name = st.text_input(
                         "Region Name", 
-                        value=f"Region_{st.session_state.region_counter + 1}",
-                        key="new_region_name"
+                        value=f"Region_{next_number}",
+                        key=f"new_region_name_{st.session_state.region_counter}"
                     )
                 
-                # Unit conversion sections (same as original implementation)
-                st.subheader("Unit Conversions (Optional)")
-                col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
-                
-                with col1:
-                    use_extinction = st.checkbox(
-                        "Use Extinction Coefficient",
-                        value=False,
-                        help="Convert absorbance slope to concentration slope"
-                    )
-                
-                with col2:
-                    extinction_coeff = st.number_input(
-                        "Extinction Coefficient (mM⁻¹cm⁻¹)",
-                        min_value=0.0,
-                        value=1.0,
-                        step=0.1,
-                        format="%.3f",
-                        disabled=not use_extinction,
-                        help="Extinction coefficient in mM⁻¹cm⁻¹"
-                    )
-                
-                with col3:
-                    target_conc_unit = st.selectbox(
-                        "Concentration Unit",
-                        ["UA", "mM", "uM"],
-                        index=2,
-                        disabled=not use_extinction,
-                        help="Target concentration unit for slope"
-                    )
-                
-                with col4:
-                    target_time_unit = st.selectbox(
-                        "Time Unit",
-                        ["s", "min"],
-                        index=0,
-                        help="Time unit for slope calculation"
-                    )
-                
-                # Enzyme units section (same as original)
-                st.subheader("Enzyme Unit Conversion")
-                col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
-                
-                with col1:
-                    use_enzyme_units = st.checkbox(
-                        "Convert to Enzyme Units",
-                        value=False,
-                        help="Convert concentration rate to enzyme activity units (U/mL or U/mg)"
-                    )
-                
-                with col2:
-                    enzyme_unit_type = st.selectbox(
-                        "Enzyme Unit Type",
-                        ["U/mL", "U/mg"],
-                        index=0,
-                        disabled=not use_enzyme_units,
-                        help="Type of enzyme activity units"
-                    )
-                
-                with col3:
-                    reaction_volume = st.number_input(
-                        "Reaction Volume (mL)",
-                        min_value=0.001,
-                        value=1.0,
-                        step=0.001,
-                        format="%.3f",
-                        disabled=not use_enzyme_units,
-                        help="Total reaction volume in mL"
-                    )
-                
-                with col4:
-                    if enzyme_unit_type == "U/mL":
-                        enzyme_volume = st.number_input(
-                            "Enzyme Volume (mL)",
-                            min_value=0.001,
-                            value=0.010,
-                            step=0.001,
-                            format="%.3f",
-                            disabled=not use_enzyme_units,
-                            help="Volume of enzyme added in mL"
-                        )
-                    else:  # U/mg
-                        enzyme_mass = st.number_input(
-                            "Enzyme Mass (mg)",
-                            min_value=0.001,
-                            value=1.0,
-                            step=0.001,
-                            format="%.3f",
-                            disabled=not use_enzyme_units,
-                            help="Mass of enzyme in mg"
-                        )
+                conversion = self._render_conversion_controls(key_prefix="region_")
                 
                 # Add region button
-                if st.button("Add Region", type="primary", use_container_width=True):
+                if st.button("Add Region", type="primary", width="stretch") or quick_add:
                     if region_name and region_name not in st.session_state.regions[selected_dataset]:
-                        ext_coeff = extinction_coeff if use_extinction else None
-                        conc_unit = target_conc_unit if use_extinction else 'UA'
-                        
-                        # Prepare enzyme units parameters
-                        enzyme_units_params = None
-                        if use_enzyme_units:
-                            enzyme_units_params = {
-                                'use_enzyme_units': True,
-                                'enzyme_unit_type': enzyme_unit_type,
-                                'reaction_volume': reaction_volume
-                            }
-                            if enzyme_unit_type == "U/mL":
-                                enzyme_units_params['enzyme_volume'] = enzyme_volume
-                            else:  # U/mg
-                                enzyme_units_params['enzyme_mass'] = enzyme_mass
-                        
-                        # Add loading animation
                         with st.spinner('☕ Analyzing kinetics...'):
                             result = self._calculate_slope(
                                 selected_dataset, new_start, new_end, region_name,
-                                ext_coeff, conc_unit, target_time_unit, enzyme_units_params
+                                conversion['extinction_coeff'], conversion['target_conc_unit'],
+                                conversion['target_time_unit'], conversion['enzyme_units'],
+                                conversion['path_length_cm']
                             )
                         
                         if result:
@@ -2144,53 +1905,29 @@ class EnzymeKineticsStreamlit:
                     else:
                         st.error("Region name already exists or is empty")
             
-            # Show existing regions (same interface as original)
-            if st.session_state.regions[selected_dataset]:
-                st.subheader("📊 Analysis Results")
-                
-                # Display regions with delete buttons
-                for i, (region_name, region_data) in enumerate(st.session_state.regions[selected_dataset].items()):
-                    with st.container():
-                        col1, col2 = st.columns([5, 1])
-                        
-                        with col1:
-                            # Format region display
-                            if 'converted_slope' in region_data and 'slope_units' in region_data:
-                                if region_data['slope_units'] in ['UA/s', 'UA/min']:
-                                    slope_display = f"{region_data['converted_slope']:.3e} {region_data['slope_units']}"
-                                else:
-                                    slope_display = f"{region_data['converted_slope']:.6f} {region_data['slope_units']}"
-                            else:
-                                slope_display = f"{region_data['slope']:.3e} UA/s"
-                            
-                            # R² feedback
-                            r_squared_val = region_data['r_squared']
-                            if r_squared_val >= 0.99:
-                                r_squared_icon = "🟢"
-                            elif r_squared_val < 0.98:
-                                r_squared_icon = "🔴"
-                            else:
-                                r_squared_icon = ""
-                            
-                            # Additional info
-                            enzyme_display = ""
-                            if region_data.get('enzyme_activity') is not None:
-                                enzyme_display = f" | Enzyme Activity: {region_data['enzyme_activity']:.6f} {region_data['enzyme_activity_units']}"
-                            
-                            mean_abs_display = ""
-                            if 'mean_absorbance' in region_data and 'absorbance_std_dev' in region_data:
-                                mean_abs_display = f" | Mean Abs: {region_data['mean_absorbance']:.4f} ± {region_data['absorbance_std_dev']:.4f} UA"
-                            
-                            st.info(f"**{region_name}** | {region_data['start']:.2f}s - {region_data['end']:.2f}s | "
-                                   f"Slope: {slope_display} | R²: {r_squared_icon}{' ' if r_squared_icon else ''}{region_data['r_squared']:.4f} | "
-                                   f"Points: {region_data['n_points']}{mean_abs_display}{enzyme_display}")
-                        
-                        with col2:
-                            if st.button("🗑️", key=f"delete_{selected_dataset}_{region_name}", 
-                                       help=f"Delete {region_name}", type="secondary"):
-                                del st.session_state.regions[selected_dataset][region_name]
-                                st.success(f"🗑️ Deleted region: {region_name}")
-                                st.rerun()
+            # ====================
+            # SECTION 7: Results Display
+            # ====================
+            individual_regions = {name: data for name, data in st.session_state.regions[selected_dataset].items()
+                                  if not name.startswith('Batch_')}
+            if individual_regions:
+                title_col, clear_col = st.columns([3, 1], vertical_alignment="bottom")
+                with title_col:
+                    st.subheader("📊 Analysis Results")
+                with clear_col:
+                    if st.button("🗑️ Clear all", key=f"clear_regions_{selected_dataset}", width="stretch",
+                                 help=f"Delete every region of {selected_dataset} (batch results are kept)"):
+                        for name in individual_regions:
+                            del st.session_state.regions[selected_dataset][name]
+                        st.rerun()
+
+                # Display regions using helper method
+                for region_name, region_data in individual_regions.items():
+                    delete_key = f"delete_{selected_dataset}_{region_name}"
+                    if self._display_region_result(region_name, region_data, delete_key):
+                        del st.session_state.regions[selected_dataset][region_name]
+                        st.success(f"Deleted region: {region_name}")
+                        st.rerun()
         
         # Batch Analysis Results Section
         # Collect all batch regions across all datasets
@@ -2208,112 +1945,57 @@ class EnzymeKineticsStreamlit:
         
         # Display batch results if any exist
         if batch_regions:
-            st.subheader("Batch Analysis Results")
-            
-            for batch_number in sorted(batch_regions.keys()):
+            title_col, clear_col = st.columns([3, 1], vertical_alignment="bottom")
+            with title_col:
+                st.subheader("Batch Analysis Results")
+            with clear_col:
+                if st.button("🗑️ Clear all", key="clear_batch_results", width="stretch", help="Delete every batch result"):
+                    for batch_data in batch_regions.values():
+                        for region_name, _, dataset_name in batch_data:
+                            del st.session_state.regions[dataset_name][region_name]
+                    st.rerun()
+
+            for batch_number in sorted(batch_regions, key=lambda number: int(number) if number.isdigit() else 0):
                 batch_data = batch_regions[batch_number]
-                st.write(f"**Batch {batch_number} Results** ({len(batch_data)} datasets processed):")
-                
+                st.write(f"**Batch {batch_number}** ({len(batch_data)} datasets)")
+
                 for region_name, region_data, dataset_name in batch_data:
-                    with st.container():
-                        col1, col2 = st.columns([5, 1])
-                        
-                        with col1:
-                            # Format batch region display to match individual results exactly
-                            if 'converted_slope' in region_data and 'slope_units' in region_data:
-                                if region_data['slope_units'] in ['UA/s', 'UA/min']:
-                                    slope_display = f"{region_data['converted_slope']:.3e} {region_data['slope_units']}"
-                                else:
-                                    slope_display = f"{region_data['converted_slope']:.6f} {region_data['slope_units']}"
-                            else:
-                                slope_display = f"{region_data['slope']:.3e} UA/s"
-                            
-                            # R² feedback
-                            r_squared_val = region_data['r_squared']
-                            if r_squared_val >= 0.99:
-                                r_squared_icon = "🟢"
-                            elif r_squared_val < 0.98:
-                                r_squared_icon = "🔴"
-                            else:
-                                r_squared_icon = ""
-                            
-                            # Additional info
-                            enzyme_display = ""
-                            if region_data.get('enzyme_activity') is not None:
-                                enzyme_display = f" | Enzyme Activity: {region_data['enzyme_activity']:.6f} {region_data['enzyme_activity_units']}"
-                            
-                            mean_abs_display = ""
-                            if 'mean_absorbance' in region_data and 'absorbance_std_dev' in region_data:
-                                mean_abs_display = f" | Mean Abs: {region_data['mean_absorbance']:.4f} ± {region_data['absorbance_std_dev']:.4f} UA"
-                            
-                            # Format
-                            st.info(f"**{region_name}** | {region_data['start']:.2f}s - {region_data['end']:.2f}s | "
-                                   f"Slope: {slope_display} | R²: {r_squared_icon}{' ' if r_squared_icon else ''}{region_data['r_squared']:.4f} | "
-                                   f"Points: {region_data['n_points']}{mean_abs_display}{enzyme_display}")
-                        
-                        with col2:
-                            if st.button("🗑️", key=f"delete_batch_{dataset_name}_{region_name}", 
-                                       help=f"Delete {region_name}", type="secondary"):
-                                del st.session_state.regions[dataset_name][region_name]
-                                st.success(f"🗑️ Deleted batch region: {region_name}")
-                                st.rerun()
-                
-                st.divider()  # Separate different batches
+                    delete_key = f"delete_batch_{dataset_name}_{region_name}"
+                    if self._display_region_result(region_name, region_data, delete_key,
+                                                    show_dataset=True, dataset_name=dataset_name):
+                        del st.session_state.regions[dataset_name][region_name]
+                        st.success(f"Deleted batch region: {region_name}")
+                        st.rerun()
+
+                st.divider()
         
-        # Global results and export (same as original implementation)
+        # ====================
+        # SECTION 8: Export
+        # ====================
         all_regions = []
         for dataset_name, regions_dict in st.session_state.regions.items():
             for region_name, region_data in regions_dict.items():
                 all_regions.append(region_data)
-        
+
         if all_regions:
             st.divider()
             st.subheader("Export All Results")
             
-            # Create comprehensive results table
-            results_data = []
-            for region in all_regions:
-                # Format data for export
-                if 'converted_slope' in region and 'slope_units' in region:
-                    if region['slope_units'] in ['UA/s', 'UA/min']:
-                        slope_display = f"{region['converted_slope']:.3e}"
-                    else:
-                        slope_display = f"{region['converted_slope']:.6f}"
-                    slope_units = region['slope_units']
-                else:
-                    slope_display = f"{region['slope']:.3e}"
-                    slope_units = 'UA/s'
-                
-                converted_std_err = region.get('converted_std_error', region['std_error'])
-                
-                result_entry = {
-                    'Dataset': region['dataset'],
-                    'Region': region['region_name'],
-                    'Start_Time': f"{region['start']:.2f}",
-                    'End_Time': f"{region['end']:.2f}",
-                    'Slope': slope_display,
-                    'Slope_Units': slope_units,
-                    'Std_Error_Converted': f"{converted_std_err:.3e}",
-                    'Original_Slope_UA_s': f"{region['slope']:.3e}",
-                    'Original_Std_Error': f"{region['std_error']:.3e}",
-                    'Extinction_Coeff': region.get('extinction_coeff', 'N/A'),
-                    'R_Squared': f"{region['r_squared']:.4f}",
-                    'Number_of_Points': region['n_points'],
-                    'RMSE': f"{region['rmse']:.4f}",
-                    'Mean_Absorbance': f"{region.get('mean_absorbance', 0):.4f}",
-                    'Absorbance_Std_Dev': f"{region.get('absorbance_std_dev', 0):.4f}"
-                }
-                
-                # Add enzyme activity if available
-                if region.get('enzyme_activity') is not None:
-                    result_entry['Enzyme_Activity'] = f"{region['enzyme_activity']:.6f}"
-                    result_entry['Enzyme_Activity_Units'] = region['enzyme_activity_units']
-                
-                results_data.append(result_entry)
-            
-            if results_data:
-                results_df = pd.DataFrame(results_data)
-                st.dataframe(results_df, use_container_width=True)
+            results_df = kinetics_core.results_table(all_regions)
+            if not results_df.empty:
+                scientific = st.column_config.NumberColumn(format="%.3e")
+                st.dataframe(results_df, width="stretch", hide_index=True, column_config={
+                    'Start_Time': st.column_config.NumberColumn(format="%.2f"),
+                    'End_Time': st.column_config.NumberColumn(format="%.2f"),
+                    'Slope': scientific, 'Std_Error_Converted': scientific,
+                    'Original_Slope_UA_s': scientific, 'Original_Std_Error': scientific,
+                    'R_Squared': st.column_config.NumberColumn(format="%.4f"),
+                    'RMSE': scientific,
+                    'Mean_Absorbance': st.column_config.NumberColumn(format="%.4f"),
+                    'Absorbance_Std_Dev': st.column_config.NumberColumn(format="%.4f"),
+                    'Enzyme_Activity': st.column_config.NumberColumn(format="%.4f"),
+                    'Enzyme_Activity_Std_Error': st.column_config.NumberColumn(format="%.4f"),
+                })
                 
                 # Export options
                 st.subheader("Export Options")
@@ -2408,6 +2090,11 @@ class EnzymeKineticsStreamlit:
                     elif col == 'Enzyme_Activity':
                         if 'Enzyme_Activity_Units' in available_columns:
                             final_columns.add('Enzyme_Activity_Units')
+                        if 'Enzyme_Activity_Std_Error' in available_columns:
+                            final_columns.add('Enzyme_Activity_Std_Error')
+                    elif col == 'Extinction_Coeff':
+                        if 'Path_Length_cm' in available_columns:
+                            final_columns.add('Path_Length_cm')
                 
                 final_columns_list = [col for col in available_columns if col in final_columns]
                 
@@ -2426,8 +2113,8 @@ class EnzymeKineticsStreamlit:
                     
                     output = io.BytesIO()
                     if export_format == "CSV (.csv)":
-                        csv_string = filtered_df.to_csv(index=False)
-                        output.write(csv_string.encode('utf-8'))
+                        # BOM so Excel opens µ and other symbols correctly
+                        output.write(filtered_df.to_csv(index=False).encode('utf-8-sig'))
                     else:  # Excel
                         with pd.ExcelWriter(output, engine='openpyxl') as writer:
                             filtered_df.to_excel(writer, index=False, sheet_name='Results')
@@ -2439,7 +2126,7 @@ class EnzymeKineticsStreamlit:
                         data=output.getvalue(),
                         file_name=filename,
                         mime=mime_type,
-                        use_container_width=True,
+                        width="stretch",
                         type="primary"
                     )
                     
