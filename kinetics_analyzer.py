@@ -622,7 +622,8 @@ class EnzymeKineticsStreamlit:
             data = st.session_state.data_sets[ds_name]
             color = colors[i % len(colors)]
             
-            fig.add_trace(go.Scatter(
+            # WebGL keeps zoom/pan smooth with thousands of points per dataset
+            fig.add_trace(go.Scattergl(
                 x=data['time'],
                 y=data['product'],
                 mode='markers',
@@ -736,7 +737,9 @@ class EnzymeKineticsStreamlit:
             width=self._get_plot_width(),
             margin=dict(l=60, r=100, t=40, b=60),
             font=dict(family="Arial", color=text_color),
-            hovermode='closest'
+            hovermode='closest',
+            # Keep the user's zoom when the page reruns (e.g. after adding a region)
+            uirevision='|'.join(datasets_to_plot)
         )
         
         # Enable selection tools
@@ -1734,14 +1737,8 @@ class EnzymeKineticsStreamlit:
         if selected_dataset:
             st.subheader("Interactive Data Visualization")
             
-            # Clear selection option
-            if 'selected_start' in st.session_state or 'selected_end' in st.session_state:
-                if st.button("Clear Selection", type="secondary"):
-                    if 'selected_start' in st.session_state:
-                        del st.session_state.selected_start
-                    if 'selected_end' in st.session_state:
-                        del st.session_state.selected_end
-                    st.rerun()
+            # Nothing above the chart may appear or disappear between reruns:
+            # Streamlit would rebuild the chart and the user's zoom would be lost.
             
             # Configure plot toolbar
             config = {
@@ -1802,14 +1799,21 @@ class EnzymeKineticsStreamlit:
                     data_times = st.session_state.data_sets[selected_dataset]['time']
                     shown_start = _clamp(st.session_state.selected_start, data_times.min(), data_times.max())
                     shown_end = _clamp(st.session_state.selected_end, data_times.min(), data_times.max())
-                    info_col, button_col = st.columns([3, 1], vertical_alignment="center")
+                    info_col, add_col, clear_col = st.columns([3, 1.4, 1], vertical_alignment="center")
                     with info_col:
                         st.info(f"Selected on {selected_dataset}: {shown_start:.2f} s to {shown_end:.2f} s")
-                    with button_col:
+                    with add_col:
                         quick_add = st.button("➕ Add region from selection", type="primary", width="stretch",
                                               help="Analyze the selection now, using the conversion settings below")
                 else:
-                    st.warning(f"Selection is for {target_dataset}, currently viewing {selected_dataset}. Switch datasets to use selection.")
+                    info_col, clear_col = st.columns([4.4, 1], vertical_alignment="center")
+                    with info_col:
+                        st.warning(f"Selection is for {target_dataset}, currently viewing {selected_dataset}. Switch datasets to use selection.")
+                with clear_col:
+                    if st.button("✖ Clear", key="clear_selection", width="stretch", help="Remove the current selection"):
+                        st.session_state.pop('selected_start', None)
+                        st.session_state.pop('selected_end', None)
+                        st.rerun()
             
             # ====================
             # SECTION 6: Region Analysis
