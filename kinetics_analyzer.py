@@ -60,20 +60,13 @@ class ColorPalette:
             '#808000', '#804000', '#400080', '#008040', '#800040'
         ]
         
-        self.viridis_palette = [
-            ('#440154', 'Dark Purple'), ('#482777', 'Deep Violet'), 
-            ('#3f4a8a', 'Royal Blue'), ('#31678e', 'Ocean Blue'),
-            ('#26838f', 'Teal Blue'), ('#1f9d8a', 'Forest Green'),
-            ('#6cce5a', 'Lime Green'), ('#b6de2b', 'Yellow Green'),
-            ('#fee825', 'Golden Yellow'), ('#f0f921', 'Bright Yellow')
-        ]
-        
-        self.nostalgic_palette = [
-            ('#000000', 'Black'), ('#FF0000', 'Red'), ('#0000FF', 'Blue'), 
-            ('#00FF00', 'Green'), ('#00FFFF', 'Cyan'), ('#FF00FF', 'Magenta'),
-            ('#FFFF00', 'Yellow'), ('#FF8000', 'Orange'), ('#8000FF', 'Purple'),
-            ('#00FF80', 'Spring Green')
-        ]
+        # Names for the first ten colors, shown in manual color selection
+        self.color_names = {
+            'viridis': ['Dark Purple', 'Deep Violet', 'Royal Blue', 'Ocean Blue', 'Teal Blue',
+                        'Forest Green', 'Lime Green', 'Yellow Green', 'Golden Yellow', 'Bright Yellow'],
+            'nostalgic': ['Black', 'Red', 'Blue', 'Green', 'Cyan', 'Magenta', 'Yellow', 'Orange',
+                          'Purple', 'Spring Green'],
+        }
     
     def get_colors(self, palette_type: str = 'viridis') -> List[str]:
         """Get color list for specified palette type."""
@@ -83,9 +76,8 @@ class ColorPalette:
     
     def get_palette(self, palette_type: str = 'viridis') -> List[Tuple[str, str]]:
         """Get palette with color names for UI selection."""
-        if palette_type == 'nostalgic':
-            return self.nostalgic_palette
-        return self.viridis_palette
+        names = self.color_names['nostalgic' if palette_type == 'nostalgic' else 'viridis']
+        return list(zip(self.get_colors(palette_type), names))
     
     def select_colors(self, n_datasets: int, palette_type: str = 'viridis', dark: bool = False) -> List[str]:
         """Select colors with maximum contrast for given number of datasets."""
@@ -219,153 +211,52 @@ class MemoryManager:
                 logger.info(f"Cleaned up AvaSpec converted file tracking for dataset: {dataset_name}")
 
 class BatchAnalyzer:
-    """
-    Safe batch analysis implementation to avoid infinite loops.
-    Phase 4 improvement: Careful batch processing architecture.
-    """
-    
+    """Analyze the same time window across several datasets."""
+
     def __init__(self, main_app):
         self.main_app = main_app
-        self.max_iterations = 100  # Safety limit to prevent infinite loops
 
-    def validate_batch_parameters(self, datasets: List[str], time_frame: Tuple[float, float]) -> bool:
+    def perform_batch_analysis(self, datasets: List[str], time_frame: Tuple[float, float],
+                               analysis_params: Dict) -> Dict[str, Dict]:
+        """Fit the window in every dataset; datasets without data in it are skipped, not fatal.
+
+        Stores a summary in st.session_state.batch_summary so it survives the rerun that follows.
         """
-        Validate batch analysis parameters to prevent issues.
-        Returns True if parameters are valid, False otherwise.
-        """
-        if not datasets or len(datasets) == 0:
-            st.error("❌ No datasets selected for batch analysis.")
-            return False
-        
-        if len(datasets) == 1:
-            st.warning("⚠️ Only one dataset selected.")
-        
         start_time, end_time = time_frame
-        if start_time >= end_time:
-            st.error("❌ Invalid time frame - start time must be less than end time.")
-            return False
-        
-        # Validate that all datasets have data in the specified time range
-        invalid_datasets = []
+        # Next number after any existing batch (also ones restored from a session file)
+        existing = [int(name.split('_')[1]) for regions in st.session_state.regions.values() for name in regions
+                    if name.startswith('Batch_') and name.split('_')[1].isdigit()]
+        batch_number = max([st.session_state.get('batch_counter', 0), *existing]) + 1
+        results, skipped = {}, []
+
         for dataset_name in datasets:
-            if dataset_name not in st.session_state.data_sets:
-                invalid_datasets.append(dataset_name)
-                continue
-            
-            data = st.session_state.data_sets[dataset_name]
-            data_min_time = data['time'].min()
-            data_max_time = data['time'].max()
-            
-            if start_time > data_max_time or end_time < data_min_time:
-                invalid_datasets.append(dataset_name)
-        
-        if invalid_datasets:
-            st.error(f"❌ Time frame ({start_time:.2f}s - {end_time:.2f}s) is outside data range for datasets: {', '.join(invalid_datasets)}")
-            return False
-        
-        return True
-    
-    def perform_batch_analysis(self, datasets: List[str], time_frame: Tuple[float, float], 
-                             analysis_params: Dict) -> Dict[str, Dict]:
-        """
-        Perform safe batch analysis across multiple datasets.
-        
-        Args:
-            datasets: List of dataset names to analyze
-            time_frame: Tuple of (start_time, end_time) for analysis
-            analysis_params: Dictionary containing analysis parameters
-            
-        Returns:
-            Dictionary with results for each dataset
-        """
-        results = {}
-        start_time, end_time = time_frame
-        
-        # Safety check - prevent infinite loops
-        if len(datasets) > self.max_iterations:
-            st.error(f"❌ **Safety Limit**: Cannot process more than {self.max_iterations} datasets in batch mode.")
-            return {}
-        
-        # Validate parameters before starting
-        if not self.validate_batch_parameters(datasets, time_frame):
-            return {}
-        
-        try:
-            # Initialize progress tracking
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            total_datasets = len(datasets)
-            processed = 0
-            
-            for i, dataset_name in enumerate(datasets):
-                # Update progress
-                progress = (i + 1) / total_datasets
-                progress_bar.progress(progress)
-                status_text.text(f"Processing dataset {i + 1} of {total_datasets}: {dataset_name}")
-                
-                # Safety check within loop
-                if i > self.max_iterations:
-                    st.error(f"❌ **Safety Limit Reached**: Stopped processing after {self.max_iterations} datasets.")
-                    break
-                
-                try:
-                    # Generate unique region name for this dataset
-                    batch_number = st.session_state.get('batch_counter', 0) + 1
-                    region_name = f"Batch_{batch_number}_{dataset_name}"
-                    
-                    # Perform slope calculation for this dataset
-                    result = self.main_app._calculate_slope(
-                        dataset_name, 
-                        start_time, 
-                        end_time, 
-                        region_name,
-                        analysis_params.get('extinction_coeff'),
-                        analysis_params.get('target_conc_unit', 'UA'),
-                        analysis_params.get('target_time_unit', 's'),
-                        analysis_params.get('enzyme_units'),
-                        analysis_params.get('path_length_cm', 1.0)
-                    )
-                    
-                    if result:
-                        # Store result in session state
-                        if dataset_name not in st.session_state.regions:
-                            st.session_state.regions[dataset_name] = {}
-                        
-                        st.session_state.regions[dataset_name][region_name] = result
-                        results[dataset_name] = result
-                        processed += 1
-                        logger.info(f"Successfully processed batch analysis for dataset: {dataset_name}")
-                    else:
-                        logger.warning(f"Failed to process batch analysis for dataset: {dataset_name}")
-                        st.warning(f"⚠️ Could not analyze dataset: {dataset_name}")
-                
-                except Exception as e:
-                    logger.error(f"Error in batch analysis for dataset {dataset_name}: {str(e)}")
-                    st.error(f"❌ Error processing {dataset_name}: {str(e)}")
-                    continue
-            
-            # Update batch counter to ensure unique region names
-            st.session_state.batch_counter = st.session_state.get('batch_counter', 0) + 1
-            
-            # Clear progress indicators
-            progress_bar.empty()
-            status_text.empty()
-            
-            # Show simple completion summary
-            if processed > 0:
-                st.success(f"✅ **Batch Analysis Complete**: Successfully processed {processed} out of {total_datasets} datasets.")
-                if processed < total_datasets:
-                    st.info(f"ℹ️ {total_datasets - processed} datasets could not be processed due to insufficient data in the specified time range.")
+            region_name = f"Batch_{batch_number}_{dataset_name}"
+            try:
+                result = self.main_app._calculate_slope(
+                    dataset_name, start_time, end_time, region_name,
+                    analysis_params.get('extinction_coeff'),
+                    analysis_params.get('target_conc_unit', 'UA'),
+                    analysis_params.get('target_time_unit', 's'),
+                    analysis_params.get('enzyme_units'),
+                    analysis_params.get('path_length_cm', 1.0)
+                )
+            except Exception as error:
+                logger.error(f"Batch analysis failed for {dataset_name}: {error}")
+                result = None
+            if result:
+                st.session_state.regions.setdefault(dataset_name, {})[region_name] = result
+                results[dataset_name] = result
             else:
-                st.error("❌ **Batch Analysis Failed**: No datasets could be processed. Please check your time range and data.")
-            
-            return results
-            
-        except Exception as e:
-            logger.error(f"Critical error in batch analysis: {str(e)}")
-            st.error(f"❌ **Critical Batch Analysis Error**: {str(e)}")
-            return {}
+                skipped.append(dataset_name)
+
+        if results:
+            st.session_state.batch_counter = batch_number
+        st.session_state.batch_summary = {
+            'batch': batch_number, 'ok': len(results), 'total': len(datasets),
+            'skipped': skipped, 'start': start_time, 'end': end_time,
+        }
+        logger.info(f"Batch {batch_number}: {len(results)}/{len(datasets)} datasets analyzed")
+        return results
 
 class ErrorHandler:
     """Centralized error handling with user-friendly messages."""
@@ -423,57 +314,6 @@ class EnzymeKineticsStreamlit:
         if 'avaspec_converted_files' not in st.session_state:
             st.session_state.avaspec_converted_files = {}  # Track converted AvaSpec files
         
-        self.quotes = [
-            "The only way to make sense out of change is to plunge into it, move with it, and join the dance - Watts",
-            "What we observe is not nature itself, but nature exposed to our method of questioning - Heisenberg",
-            "Kinetics tells us how fast, thermodynamics tells us how far",
-            "Every reaction has its optimal path - trust the data to show you",
-            "R² > 0.99: Excellent fit. R² < 0.98: Time for coffee and reconsideration",
-            "The enzyme knows chemistry better than the chemist",
-            "Linear kinetics: when enzymes behave like good students",
-            "Why don't enzymes ever get tired? They have infinite turnover rates in their dreams",
-            "Enzymes are like good friends: they lower your activation energy for getting things done",
-            "What did the substrate say to the enzyme? You complete me... by breaking me apart",
-            "Allosteric enzymes: proof that proteins have mood swings",
-            "Fact: Some enzymes are so efficient they approach the diffusion limit - nature's speed demons",
-            "Enzymes: billions of years of R&D, no patents required",
-            "DNA: the world's most successful backup system (with occasional corrupted files)",
-            "RNA: Jack of all trades, master of everything - sorry proteins!",
-            "Ribozymes proved that RNA doesn't need protein chaperones to get things done",
-            "DNA polymerase has 3' to 5' exonuclease activity because even evolution believes in proofreading",
-            "Why did the ribosome break up with the polysome? Too much translation drama",
-            "Fact: Your DNA contains the instructions for about 20,000-25,000 proteins (assembly required)",
-            "Telomerase: the enzyme trying to make you immortal (aging has entered the chat)",
-            "DNA repair mechanisms: your genome's personal IT department working 24/7",
-            "Why don't DNA strands ever get lost? They always know their 5' from their 3' end",
-            "LUCA (Last Universal Common Ancestor): the ultimate single parent raising 4 billion years of offspring",
-            "RNA World hypothesis: back when RNA was CEO, CFO, and the entire workforce",
-            "Primordial soup: Earth's first attempt at molecular cuisine (no recipe book included)",
-            "Iron-sulfur clusters: the original catalysts, still going strong after 3.8 billion years",
-            "Miller-Urey experiment: proof that you can make amino acids from lightning and patience",
-            "Fact: Cyanobacteria invented photosynthesis and accidentally created the oxygen apocalypse",
-            "Hydrothermal vents: where life possibly started in nature's pressure cookers",
-            "Self-replication: the ultimate mystery - how did molecules learn to copy themselves?",
-            "From chemistry to biology: the greatest startup story never fully documented",
-            "Autocatalytic networks: when molecules formed the first self-sustaining businesses",
-            "Evolution: 4 billion years of A/B testing with no rollback option",
-            "Endosymbiotic theory: the first successful corporate merger in cellular history",
-            "In God we trust, all others must bring data - Deming",
-            "The best thing about being a statistician is that you get to play in everyone's backyard - Tukey",
-            "Without data, you're just another person with an opinion - Edwards",
-            "Correlation does not imply causation, but it does waggle its eyebrows suggestively",
-            "A good plot is worth a thousand p-values",
-            "Caffeine: the molecule that powers science",
-            "Good coffee, good data, good science",
-            "Lab rule #1: Never trust data collected before the first cup of coffee",
-            "Science runs on coffee and curiosity",
-            "The universal solvent for scientific problems: coffee",
-            "Fact: Your morning coffee contains over 1000 different chemical compounds",
-            "Fact: Ribozymes can cut and paste RNA like molecular scissors and glue",
-            "Fact: The ribosome is a ribozyme - your protein factory is made of RNA",
-            "Fact: Some RNA molecules can evolve in test tubes in just hours",
-            "Fact: DNA repair enzymes fix about 1000 DNA damages per cell per day - busy little workers"
-        ]
     
     def _get_plot_width(self) -> int:
         """Get plot width based on user selection."""
@@ -547,10 +387,8 @@ class EnzymeKineticsStreamlit:
                     return self._load_excel_file(uploaded_file)
             
             # Handle other file types
-            elif file_extension == '.txt':
-                return self._load_txt_file(uploaded_file)
-            elif file_extension == '.csv':
-                return self._load_csv_file(uploaded_file)
+            elif file_extension in ('.txt', '.csv'):
+                return self._load_text_file(uploaded_file)
             else:
                 st.error(f"Unsupported file format: {file_extension}")
                 return None
@@ -559,22 +397,12 @@ class EnzymeKineticsStreamlit:
             self.error_handler.handle_file_load_error(uploaded_file.name, e)
             return None
     
-    def _load_txt_file(self, uploaded_file) -> pd.DataFrame:
-        """Load data from a TXT file (any common separator, comments, decimal commas)."""
-        return kinetics_core.read_text_table(kinetics_core.decode_text(uploaded_file.getvalue()))
-    
-    def _load_csv_file(self, uploaded_file) -> pd.DataFrame:
-        """Load data from a CSV file, including ';'-separated decimal-comma exports."""
+    def _load_text_file(self, uploaded_file) -> pd.DataFrame:
+        """TXT or CSV with any common separator, comment lines or decimal commas."""
         return kinetics_core.read_text_table(kinetics_core.decode_text(uploaded_file.getvalue()))
     
     def _load_excel_file(self, uploaded_file) -> pd.DataFrame:
-        """Load data from Excel file."""
-        df = pd.read_excel(uploaded_file)
-        return self._standardize_columns(df)
-    
-    def _standardize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Standardize column names for consistent processing."""
-        return kinetics_core.standardize_columns(df)
+        return kinetics_core.standardize_columns(pd.read_excel(uploaded_file))
     
     def _create_interactive_plot(self, dataset_name: str = None, show_regions: bool = True, overlay_datasets: List[str] = None) -> go.Figure:
         """Create interactive Plotly figure with enhanced color management."""
@@ -633,6 +461,9 @@ class EnzymeKineticsStreamlit:
                     color=color, 
                     opacity=st.session_state.get('plot_marker_opacity', 0.5)
                 ),
+                # Same look for selected/unselected points: no costly restyle while selecting
+                selected=dict(marker=dict(opacity=st.session_state.get('plot_marker_opacity', 0.5))),
+                unselected=dict(marker=dict(opacity=st.session_state.get('plot_marker_opacity', 0.5))),
                 hovertemplate=f'{ds_name}: %{{x:.1f}}s, %{{y:.3f}} UA<extra></extra>',
                 showlegend=False,
                 legendgroup=ds_name,
@@ -648,34 +479,6 @@ class EnzymeKineticsStreamlit:
                 legendgroup=ds_name,
                 hoverinfo='skip'
             ))
-        
-        # Add current selection highlight
-        if hasattr(st.session_state, 'selected_start') and hasattr(st.session_state, 'selected_end'):
-            if 'selected_start' in st.session_state and 'selected_end' in st.session_state:
-                y_min, y_max = self._padded_y_range(datasets_to_plot, 0.05)
-                
-                selection_color = '#6cce5a'  # Viridis green
-                fig.add_shape(
-                    type="rect",
-                    x0=st.session_state.selected_start,
-                    y0=y_min,
-                    x1=st.session_state.selected_end,
-                    y1=y_max,
-                    fillcolor='rgba(108, 206, 90, 0.2)',
-                    line=dict(color=selection_color, width=2, dash='dash'),
-                    layer="below"
-                )
-                
-                fig.add_annotation(
-                    x=(st.session_state.selected_start + st.session_state.selected_end) / 2,
-                    y=y_max,
-                    text=f"Selected: {st.session_state.selected_start:.1f}s - {st.session_state.selected_end:.1f}s",
-                    showarrow=False,
-                    font=dict(size=12, color=selection_color),
-                    bgcolor='rgba(255, 255, 255, 0.8)',
-                    bordercolor=selection_color,
-                    borderwidth=1
-                )
         
         # Add region highlights if available
         if show_regions and datasets_to_plot:
@@ -771,25 +574,27 @@ class EnzymeKineticsStreamlit:
         padding = (y_max - y_min) * fraction or abs(y_max) * fraction or fraction
         return y_min - padding, y_max + padding
 
+    @staticmethod
+    def _clear_selection() -> None:
+        """Forget the current selection and remove the drawn box from the chart."""
+        st.session_state.pop('selected_start', None)
+        st.session_state.pop('selected_end', None)
+        st.session_state.pop('last_box_range', None)
+        st.session_state.chart_revision = st.session_state.get('chart_revision', 0) + 1
+
     def _add_fit_line(self, fig: go.Figure, dataset_name: str, region_name: str, region_data: dict,
                       color: str, label: str = "Fit") -> None:
-        """Draw a region's regression line with a soft glow underneath."""
-        data = st.session_state.data_sets[dataset_name]
-        region_subset = data[(data['time'] >= region_data['start']) & (data['time'] <= region_data['end'])]
-        if region_subset.empty:
+        """Draw a region's regression line. Two end points are enough for a straight line."""
+        times = st.session_state.data_sets[dataset_name]['time']
+        in_region = times[(times >= region_data['start']) & (times <= region_data['end'])]
+        if in_region.empty:
             return
-        fitted_y = region_data['slope'] * region_subset['time'] + region_data['intercept']
-        line_width = st.session_state.get('plot_line_width', 5)
-        red, green, blue = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+        x_ends = [float(in_region.min()), float(in_region.max())]
         fig.add_trace(go.Scatter(
-            x=region_subset['time'], y=fitted_y, mode='lines',
-            line=dict(width=line_width * 2, color=f'rgba({red}, {green}, {blue}, 0.2)'),
-            hoverinfo='skip', showlegend=False
-        ))
-        fig.add_trace(go.Scatter(
-            x=region_subset['time'], y=fitted_y, mode='lines',
+            x=x_ends, y=[region_data['slope'] * x + region_data['intercept'] for x in x_ends],
+            mode='lines',
             name=f'{dataset_name} - {region_name} fit',
-            line=dict(width=line_width, color=color),
+            line=dict(width=st.session_state.get('plot_line_width', 5), color=color),
             opacity=st.session_state.get('plot_line_opacity', 1.0),
             hovertemplate=f'{label}: %{{y:.3f}}<extra></extra>',
             showlegend=False, legendgroup=dataset_name
@@ -819,14 +624,7 @@ class EnzymeKineticsStreamlit:
             slope_display = f"{region_data['slope']:.4g}"
             slope_units = 'UA/s'
 
-        # R-squared quality assessment
         r_squared = region_data['r_squared']
-        if r_squared >= 0.99:
-            r_quality = 'excellent'
-        elif r_squared >= 0.98:
-            r_quality = 'warning'
-        else:
-            r_quality = 'poor'
 
         # Standard error formatting
         if 'converted_std_error' in region_data and region_data.get('converted_std_error') is not None:
@@ -839,7 +637,6 @@ class EnzymeKineticsStreamlit:
             'slope_units': slope_units,
             'slope_with_units': f"{slope_display} {slope_units}",
             'r_squared': f"{r_squared:.4f}",
-            'r_quality': r_quality,
             'time_range': self._format_time_range(region_data),
             'n_points': region_data['n_points'],
             'std_error': std_err_display,
@@ -913,33 +710,10 @@ class EnzymeKineticsStreamlit:
         return delete_clicked
 
     def _generate_txt_content(self, dataset_name: str, original_filename: str) -> str:
-        """Generate TXT file content for converted AvaSpec data."""
+        """TXT file content for converted AvaSpec data."""
         if dataset_name not in st.session_state.data_sets:
             return ""
-        
-        data = st.session_state.data_sets[dataset_name]
-        
-        # Create TXT content with header
-        txt_content = []
-        txt_content.append("##################################################")
-        txt_content.append("# DATA EXPORT AND TRANSFORMATION REPORT")
-        txt_content.append("#")
-        txt_content.append(f"# Original File: {original_filename}")
-        txt_content.append(f"# Converted by: Kinetics Analyzer v{APP_VERSION}")
-        txt_content.append(f"# Processing Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        txt_content.append("#")
-        txt_content.append("# Operations Performed:")
-        txt_content.append("# - Column 1 (Time): Read from Excel Column B (milliseconds), divided by 1000.")
-        txt_content.append("# - Column 2 (Absorbance): Read from Excel Column C, comma decimal converted to dot decimal.")
-        txt_content.append("##################################################")
-        txt_content.append("")
-        txt_content.append("Time (s)\tUA")
-        
-        # Add data rows
-        for _, row in data.iterrows():
-            txt_content.append(f"{row['time']:.3f}\t{row['product']:.6f}")
-        
-        return '\n'.join(txt_content)
+        return kinetics_core.avaspec_txt(st.session_state.data_sets[dataset_name], original_filename)
     
     def _create_zip_download(self, converted_files: Dict[str, str], filename: str = "avaspec_converted_files.zip") -> bytes:
         """Create a ZIP file containing all converted TXT files."""
@@ -1035,6 +809,406 @@ class EnzymeKineticsStreamlit:
             'path_length_cm': path_length_cm,
             'enzyme_units': enzyme_units,
         }
+
+    @st.fragment
+    def _analysis_panel(self, selected_dataset: str, overlay_datasets: List[str]) -> None:
+        """Selection row plus single-region or batch analysis.
+
+        Runs as a fragment, so typing values or ticking boxes here doesn't redraw the chart.
+        Actions that change results call st.rerun() to refresh the whole app.
+        """
+        st.subheader("Analysis")
+        multiple = len(st.session_state.data_sets) > 1
+        modes = ["Single region", "Batch (several datasets)"] if multiple else ["Single region"]
+        if st.session_state.get('analysis_mode') not in modes:
+            st.session_state.analysis_mode = modes[0]
+        if multiple:
+            st.radio("Analyze", modes, key="analysis_mode", horizontal=True, label_visibility="collapsed")
+        batch_mode = st.session_state.analysis_mode == modes[-1] and multiple
+
+        # Current selection, with a one-click way to analyze it
+        quick_run = False
+        if 'selected_start' in st.session_state and 'selected_end' in st.session_state:
+            target_dataset = st.session_state.get('selected_for_dataset', 'Unknown')
+            if target_dataset == selected_dataset or batch_mode:
+                info_col, add_col, clear_col = st.columns([3, 1.4, 1], vertical_alignment="center")
+                with info_col:
+                    st.info(f"Selected: {st.session_state.selected_start:.2f} s to {st.session_state.selected_end:.2f} s")
+                with add_col:
+                    label = "▶ Run batch on selection" if batch_mode else "➕ Add region from selection"
+                    quick_run = st.button(label, type="primary", width="stretch",
+                                          help="Analyze the selection now, using the settings below")
+            else:
+                info_col, clear_col = st.columns([4.4, 1], vertical_alignment="center")
+                with info_col:
+                    st.warning(f"Selection is for {target_dataset}, currently viewing {selected_dataset}. Switch datasets to use selection.")
+            with clear_col:
+                if st.button("✖ Clear", key="clear_selection", width="stretch", help="Remove the current selection"):
+                    self._clear_selection()
+                    st.rerun()
+
+        if batch_mode:
+            self._render_batch_form(overlay_datasets, quick_run)
+        else:
+            self._render_region_form(selected_dataset, quick_run)
+
+    def _render_region_form(self, selected_dataset: str, quick_add: bool) -> None:
+        """Inputs and button to analyze one region of the selected dataset."""
+        # Add new region section (keeping same interface as original)
+        with st.expander("Add New Region", expanded=True):
+            # Time range selection
+            col1, col2, col3 = st.columns([2, 2, 2])
+
+            with col1:
+                data_min = float(st.session_state.data_sets[selected_dataset]['time'].min())
+                data_max = float(st.session_state.data_sets[selected_dataset]['time'].max())
+
+                selection_counter = st.session_state.get('selection_counter', 0)
+                has_selection = ('selected_start' in st.session_state and 
+                               st.session_state.get('selected_for_dataset') == selected_dataset)
+
+                if has_selection:
+                    default_start = _clamp(st.session_state.selected_start, data_min, data_max)
+                else:
+                    default_start = data_min
+
+                new_start = st.number_input(
+                    "Start (s)",
+                    min_value=data_min,
+                    max_value=data_max,
+                    value=float(default_start),
+                    step=0.1,
+                    format="%.2f",
+                    key=f"start_time_{selection_counter}",
+                    help="Start time of the region (auto-filled from plot selection)"
+                )
+
+            with col2:
+                if has_selection:
+                    default_end = _clamp(st.session_state.selected_end, new_start, data_max)
+                else:
+                    default_end = data_max
+
+                new_end = st.number_input(
+                    "End (s)",
+                    min_value=new_start,
+                    max_value=data_max,
+                    value=float(default_end),
+                    step=0.1,
+                    format="%.2f",
+                    key=f"end_time_{selection_counter}",
+                    help="End time of the region (auto-filled from plot selection)"
+                )
+
+            with col3:
+                existing_names = st.session_state.regions[selected_dataset]
+                next_number = st.session_state.region_counter + 1
+                while f"Region_{next_number}" in existing_names:
+                    next_number += 1
+                region_name = st.text_input(
+                    "Region Name", 
+                    value=f"Region_{next_number}",
+                    key=f"new_region_name_{st.session_state.region_counter}"
+                )
+
+            conversion = self._render_conversion_controls(key_prefix="region_")
+
+            # Add region button
+            if st.button("Add Region", type="primary", width="stretch") or quick_add:
+                if region_name and region_name not in st.session_state.regions[selected_dataset]:
+                    with st.spinner('☕ Analyzing kinetics...'):
+                        result = self._calculate_slope(
+                            selected_dataset, new_start, new_end, region_name,
+                            conversion['extinction_coeff'], conversion['target_conc_unit'],
+                            conversion['target_time_unit'], conversion['enzyme_units'],
+                            conversion['path_length_cm']
+                        )
+
+                    if result:
+                        st.session_state.regions[selected_dataset][region_name] = result
+                        st.session_state.region_counter += 1
+
+                        # Clear the selection after successful region addition
+                        self._clear_selection()
+
+                        st.success(f"✅ Added region: {region_name}")
+                        st.rerun()
+                else:
+                    st.error("Region name already exists or is empty")
+
+    def _render_batch_form(self, overlay_datasets: List[str], quick_run: bool) -> None:
+        """Analyze the same time window in several datasets at once."""
+        names = list(st.session_state.data_sets)
+        if 'batch_datasets' not in st.session_state:
+            st.session_state.batch_datasets = [n for n in overlay_datasets if n in names] or names
+        else:
+            st.session_state.batch_datasets = [n for n in st.session_state.batch_datasets if n in names]
+
+        summary = st.session_state.get('batch_summary')
+        if summary:
+            message = (f"Batch {summary['batch']}: analyzed {summary['ok']} of {summary['total']} datasets "
+                       f"({summary['start']:.2f}–{summary['end']:.2f} s). Results are listed below.")
+            if not summary['ok']:
+                st.error(f"Batch failed: no dataset has data between {summary['start']:.2f} and {summary['end']:.2f} s.")
+            elif summary['skipped']:
+                st.warning(message + f" Skipped (no data in that window): {', '.join(summary['skipped'])}")
+            else:
+                st.success(message)
+
+        pick_col, all_col = st.columns([4, 1], vertical_alignment="bottom")
+        with all_col:
+            st.button("Select all", key="batch_select_all", width="stretch",
+                      on_click=lambda: st.session_state.update(batch_datasets=list(names)))
+        with pick_col:
+            chosen = st.multiselect("Datasets", names, key="batch_datasets")
+        if not chosen:
+            st.info("Choose at least one dataset.")
+            return
+
+        starts = [float(st.session_state.data_sets[n]['time'].min()) for n in chosen]
+        ends = [float(st.session_state.data_sets[n]['time'].max()) for n in chosen]
+        overall = (min(starts), max(ends))
+        common = (max(starts), min(ends))
+        if 'selected_start' in st.session_state:
+            default = (_clamp(st.session_state.selected_start, *overall), _clamp(st.session_state.selected_end, *overall))
+            source = "from the plot selection"
+        else:
+            default = common if common[0] < common[1] else overall
+            source = "the time range shared by the chosen datasets (draw a box on the plot to change it)"
+
+        counter = st.session_state.get('selection_counter', 0)
+        start_col, end_col = st.columns(2)
+        with start_col:
+            batch_start = st.number_input("Start (s)", value=default[0], step=0.1, format="%.2f",
+                                          key=f"batch_start_{counter}")
+        with end_col:
+            batch_end = st.number_input("End (s)", value=default[1], step=0.1, format="%.2f",
+                                        key=f"batch_end_{counter}")
+        st.caption(f"Window: {source}.")
+
+        conversion = self._render_conversion_controls(key_prefix="batch_")
+
+        if st.button("▶ Run Batch Analysis", type="primary", width="stretch") or quick_run:
+            if batch_end <= batch_start:
+                st.error("End time must be after start time.")
+                return
+            with st.spinner('☕ Analyzing datasets...'):
+                self.batch_analyzer.perform_batch_analysis(chosen, (batch_start, batch_end), conversion)
+            self._clear_selection()
+            st.rerun()
+
+    def _render_batch_results(self) -> None:
+        """One compact table per batch, with a delete button for each batch."""
+        batches: Dict[int, List[Tuple[str, str]]] = {}
+        for dataset_name, regions_dict in st.session_state.regions.items():
+            for region_name, region_data in regions_dict.items():
+                parts = region_name.split('_')
+                if region_name.startswith('Batch_') and len(parts) >= 2 and parts[1].isdigit():
+                    batches.setdefault(int(parts[1]), []).append((dataset_name, region_name))
+        if not batches:
+            return
+
+        title_col, clear_col = st.columns([3, 1], vertical_alignment="bottom")
+        with title_col:
+            st.subheader("Batch Analysis Results")
+        with clear_col:
+            if st.button("🗑️ Clear all", key="clear_batch_results", width="stretch", help="Delete every batch result"):
+                for members in batches.values():
+                    for dataset_name, region_name in members:
+                        del st.session_state.regions[dataset_name][region_name]
+                st.session_state.pop('batch_summary', None)
+                st.rerun()
+
+        for batch_number in sorted(batches):
+            members = batches[batch_number]
+            regions = [st.session_state.regions[ds][name] for ds, name in members]
+            table = kinetics_core.results_table(regions)
+            columns = [c for c in ['Dataset', 'Slope', 'Slope_Units', 'Std_Error_Converted', 'R_Squared',
+                                   'Number_of_Points', 'Enzyme_Activity', 'Enzyme_Activity_Units']
+                       if c in table.columns]
+            head_col, delete_col = st.columns([5, 1], vertical_alignment="center")
+            with head_col:
+                first = regions[0]
+                st.markdown(f"**Batch {batch_number}** · {len(members)} datasets · {self._format_time_range(first)}")
+            with delete_col:
+                if st.button("🗑️", key=f"delete_batch_{batch_number}", help=f"Delete batch {batch_number}"):
+                    for dataset_name, region_name in members:
+                        del st.session_state.regions[dataset_name][region_name]
+                    st.rerun()
+            st.dataframe(table[columns], hide_index=True, width="stretch", column_config={
+                'Slope': st.column_config.NumberColumn(format="%.4g"),
+                'Std_Error_Converted': st.column_config.NumberColumn("Std Error", format="%.3g"),
+                'R_Squared': st.column_config.NumberColumn("R²", format="%.4f"),
+                'Number_of_Points': st.column_config.NumberColumn("Points"),
+                'Enzyme_Activity': st.column_config.NumberColumn("Activity", format="%.4g"),
+                'Enzyme_Activity_Units': "Activity units",
+                'Slope_Units': "Units",
+            })
+
+    @st.fragment
+    def _export_section(self, all_regions: List[Dict]) -> None:
+        """Results table and download. A fragment, so export options don't redraw the chart."""
+        if all_regions:
+            st.divider()
+            st.subheader("Export All Results")
+            
+            results_df = kinetics_core.results_table(all_regions)
+            if not results_df.empty:
+                scientific = st.column_config.NumberColumn(format="%.3e")
+                st.dataframe(results_df, width="stretch", hide_index=True, column_config={
+                    'Start_Time': st.column_config.NumberColumn(format="%.2f"),
+                    'End_Time': st.column_config.NumberColumn(format="%.2f"),
+                    'Slope': scientific, 'Std_Error_Converted': scientific,
+                    'Original_Slope_UA_s': scientific, 'Original_Std_Error': scientific,
+                    'R_Squared': st.column_config.NumberColumn(format="%.4f"),
+                    'RMSE': scientific,
+                    'Mean_Absorbance': st.column_config.NumberColumn(format="%.4f"),
+                    'Absorbance_Std_Dev': st.column_config.NumberColumn(format="%.4f"),
+                    'Enzyme_Activity': st.column_config.NumberColumn(format="%.4f"),
+                    'Enzyme_Activity_Std_Error': st.column_config.NumberColumn(format="%.4f"),
+                })
+                
+                # Export options
+                st.subheader("Export Options")
+                col1, col2 = st.columns([2, 1])
+                
+                with col1:
+                    st.write("**Select optional data to export:**")
+                    st.caption("Basic information, statistical data (R², Number of Points), and RMSE are always included")
+                    
+                    available_columns = list(results_df.columns)
+                    mandatory_columns = {
+                        'Dataset', 'Region', 'Start_Time', 'End_Time', 
+                        'R_Squared', 'Number_of_Points', 'RMSE'
+                    }
+                    
+                    export_cols = {}
+                    col_a, col_b = st.columns(2)
+                    
+                    with col_a:
+                        export_cols['Slope'] = st.checkbox(
+                            "Transformed Slope",
+                            value=True,
+                            key="export_transformed_slope",
+                            help="Includes slope values, units, and standard error"
+                        )
+                        
+                        export_cols['Original_Slope_UA_s'] = st.checkbox(
+                            "Original Slope",
+                            value=True,
+                            key="export_original_slope",
+                            help="Includes original slope (UA/s) and standard error"
+                        )
+                    
+                    with col_b:
+                        export_cols['Mean_Absorbance'] = st.checkbox(
+                            "Mean Absorbance",
+                            value=True,
+                            key="export_mean_absorbance",
+                            help="Mean absorbance value and standard deviation for each region"
+                        )
+                        
+                        export_cols['Extinction_Coeff'] = st.checkbox(
+                            "Extinction Coefficient",
+                            value=False,
+                            key="export_extinction_coeff",
+                            help="Extinction coefficient used in calculations"
+                        )
+                        
+                        if 'Enzyme_Activity' in available_columns:
+                            export_cols['Enzyme_Activity'] = st.checkbox(
+                                "Enzyme Activity",
+                                value=True,
+                                key="export_enzyme_activity",
+                                help="Includes enzyme activity values and units"
+                            )
+                
+                with col2:
+                    st.write("**Export Settings:**")
+                    
+                    custom_filename = st.text_input(
+                        "Filename (without extension)",
+                        value="kinetics_analysis_results",
+                        help="Enter filename without extension"
+                    )
+                    
+                    export_format = st.selectbox(
+                        "Export Format",
+                        ["Excel (.xlsx)", "CSV (.csv)"],
+                        index=0,
+                        help="File format for export"
+                    )
+                
+                # Handle column dependencies and create download
+                selected_columns = [col for col, selected in export_cols.items() if selected]
+                final_columns = set(mandatory_columns.intersection(available_columns))
+                
+                # Add selected columns and dependencies
+                for col in selected_columns:
+                    final_columns.add(col)
+                    
+                    if col == 'Slope':
+                        if 'Slope_Units' in available_columns:
+                            final_columns.add('Slope_Units')
+                        if 'Std_Error_Converted' in available_columns:
+                            final_columns.add('Std_Error_Converted')
+                    elif col == 'Original_Slope_UA_s':
+                        if 'Original_Std_Error' in available_columns:
+                            final_columns.add('Original_Std_Error')
+                    elif col == 'Mean_Absorbance':
+                        if 'Absorbance_Std_Dev' in available_columns:
+                            final_columns.add('Absorbance_Std_Dev')
+                    elif col == 'Enzyme_Activity':
+                        if 'Enzyme_Activity_Units' in available_columns:
+                            final_columns.add('Enzyme_Activity_Units')
+                        if 'Enzyme_Activity_Std_Error' in available_columns:
+                            final_columns.add('Enzyme_Activity_Std_Error')
+                    elif col == 'Extinction_Coeff':
+                        if 'Path_Length_cm' in available_columns:
+                            final_columns.add('Path_Length_cm')
+                
+                final_columns_list = [col for col in available_columns if col in final_columns]
+                
+                if final_columns_list:
+                    filtered_df = results_df[final_columns_list]
+                    
+                    # Create file data based on format
+                    if export_format == "CSV (.csv)":
+                        file_extension = ".csv"
+                        mime_type = "text/csv"
+                    else:  # Excel
+                        file_extension = ".xlsx"
+                        mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    
+                    filename = f"{custom_filename}{file_extension}"
+                    
+                    output = io.BytesIO()
+                    if export_format == "CSV (.csv)":
+                        # BOM so Excel opens µ and other symbols correctly
+                        output.write(filtered_df.to_csv(index=False).encode('utf-8-sig'))
+                    else:  # Excel
+                        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                            filtered_df.to_excel(writer, index=False, sheet_name='Results')
+                    
+                    output.seek(0)
+                    
+                    st.download_button(
+                        label="📥 Download Results",
+                        data=output.getvalue(),
+                        file_name=filename,
+                        mime=mime_type,
+                        width="stretch",
+                        type="primary"
+                    )
+                    
+                    # Show auto-included columns info
+                    auto_included = [col for col in final_columns_list if col not in selected_columns]
+                    if auto_included:
+                        st.info(f"Auto-included: {', '.join(auto_included)}")
+                    
+                    st.success(f"Ready to download {len(filtered_df)} rows with {len(final_columns_list)} columns")
+                else:
+                    st.warning("Please select at least one optional column to export")
 
     SESSION_SETTING_KEYS = ['theme', 'color_palette_type', 'color_mode', 'plot_marker_size',
                             'plot_marker_opacity', 'plot_line_width', 'plot_line_opacity',
@@ -1150,28 +1324,6 @@ class EnzymeKineticsStreamlit:
             font-size: 1.1rem;
             opacity: 0.8;
         }}
-        .metric-container {{
-            background: {theme_vars['bg_secondary']};
-            color: {theme_vars['text_primary']};
-            padding: 1rem;
-            border-radius: 8px;
-            border: 1px solid {theme_vars['border_color']};
-            margin: 0.5rem 0;
-        }}
-        .upload-section {{
-            background: {theme_vars['bg_secondary']};
-            padding: 1.5rem;
-            border-radius: 8px;
-            border: 2px dashed {theme_vars['border_color']};
-            margin: 1rem 0;
-        }}
-        .success-msg {{
-            background: {theme_vars['accent_color']};
-            color: white;
-            padding: 0.5rem 1rem;
-            border-radius: 4px;
-            margin: 0.25rem 0;
-        }}
         
         /* Subtle hover effects and animations */
         .stButton > button {{
@@ -1190,17 +1342,6 @@ class EnzymeKineticsStreamlit:
             margin: 0.5rem 0;
         }}
         
-        /* Coffee cup animation for loading states */
-        @keyframes coffee-steam {{
-            0% {{ opacity: 0.8; transform: translateY(0px) scale(1); }}
-            50% {{ opacity: 0.4; transform: translateY(-10px) scale(1.1); }}
-            100% {{ opacity: 0.8; transform: translateY(0px) scale(1); }}
-        }}
-        
-        .coffee-loading {{
-            animation: coffee-steam 2s ease-in-out infinite;
-        }}
-
         /* Keep result numbers readable in narrow columns */
         [data-testid="stMetricValue"] {{
             font-size: 1.6rem;
@@ -1213,7 +1354,7 @@ class EnzymeKineticsStreamlit:
         # ====================
         # Professional header with same styling as original
         if 'header_quote' not in st.session_state:
-            st.session_state.header_quote = random.choice(self.quotes)
+            st.session_state.header_quote = random.choice(kinetics_core.QUOTES)
         selected_quote = st.session_state.header_quote
         st.markdown(f"""
         <div class="main-header">
@@ -1640,97 +1781,6 @@ class EnzymeKineticsStreamlit:
             overlay_datasets = []
             show_overlay = False
         
-        # Phase 4: Safe Batch Analysis Section (Overlay Mode Only)
-        if len(st.session_state.data_sets) > 1 and show_overlay:
-            st.subheader("Batch Analysis")
-            
-            with st.expander("Batch Process Multiple Datasets", expanded=False):
-                st.info("**Batch Analysis**: Analyze the same time region across multiple datasets simultaneously.")
-                
-                # Dataset selection for batch
-                batch_datasets = st.multiselect(
-                    "Select Datasets for Batch Analysis",
-                    options=list(st.session_state.data_sets.keys()),
-                    default=[],
-                    help="Choose datasets to analyze in batch mode"
-                )
-                
-                if batch_datasets and len(batch_datasets) > 1:
-                    # Check for interactive selection
-                    has_interactive_selection = ('selected_start' in st.session_state and 
-                                               'selected_end' in st.session_state)
-                    
-                    # Time frame selection with manual modification capability
-                    if has_interactive_selection:
-                        st.success(f"✅ **Plot Selection Available**: {st.session_state.selected_start:.2f}s - {st.session_state.selected_end:.2f}s")
-                        
-                        # Get data ranges for validation
-                        all_data_min = min([st.session_state.data_sets[ds]['time'].min() for ds in batch_datasets])
-                        all_data_max = max([st.session_state.data_sets[ds]['time'].max() for ds in batch_datasets])
-                        
-                        # Manual time range inputs (like normal mode)
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            batch_start = st.number_input(
-                                "Batch Start Time (s)",
-                                min_value=float(all_data_min),
-                                max_value=float(all_data_max),
-                                value=_clamp(st.session_state.selected_start, all_data_min, all_data_max),
-                                step=0.1,
-                                format="%.2f",
-                                key="batch_start_time",
-                                help="Start time for batch analysis (auto-filled from plot selection)"
-                            )
-                        with col2:
-                            batch_end = st.number_input(
-                                "Batch End Time (s)",
-                                min_value=float(max(batch_start, all_data_min)),
-                                max_value=float(all_data_max),
-                                value=_clamp(st.session_state.selected_end, max(batch_start, all_data_min), all_data_max),
-                                step=0.1,
-                                format="%.2f",
-                                key="batch_end_time",
-                                help="End time for batch analysis (auto-filled from plot selection)"
-                            )
-                        
-                    else:
-                        # No selection available - show instruction
-                        st.warning("📍 **No Plot Selection Found**")
-                        st.info("**Please make a selection on the plot above to set the batch analysis time range.**")
-                        st.caption("Use the box select tool in the plot toolbar to drag across your desired time range.")
-                        
-                        # Don't show batch analysis options without selection, but continue with rest of UI
-                        st.info("💡 **Batch analysis will be available once you make a plot selection.**")
-                        # Don't return here - let the rest of the UI continue
-                    
-                    # Only show batch analysis parameters if there's a selection
-                    if has_interactive_selection:
-                        st.write("**Batch Analysis Parameters:**")
-                        batch_conversion = self._render_conversion_controls(key_prefix="batch_")
-                        
-                        # Run batch analysis button
-                        if st.button("Run Batch Analysis", type="primary", width="stretch"):
-                            batch_params = batch_conversion
-                            
-                            # Run safe batch analysis
-                            batch_results = self.batch_analyzer.perform_batch_analysis(
-                                batch_datasets,
-                                (batch_start, batch_end),
-                                batch_params
-                            )
-                            
-                            if batch_results:
-                                st.rerun()  # Refresh to show new regions
-                
-                elif batch_datasets and len(batch_datasets) == 1:
-                    st.info("💡 Select 2 or more datasets for batch analysis, or use the regular region analysis above.")
-                elif len(batch_datasets) == 0:
-                    st.info("💡 Choose datasets above to enable batch analysis options.")
-        
-        elif len(st.session_state.data_sets) > 1 and not show_overlay:
-            st.subheader("Batch Analysis")
-            st.info("💡 Enable overlay mode above to access batch processing features.")
-        
         # ====================
         # SECTION 5: Interactive Plot
         # ====================
@@ -1769,145 +1819,31 @@ class EnzymeKineticsStreamlit:
                 unique_plot_key = f"{plot_key}_{datasets_hash}"
             else:
                 unique_plot_key = f"{plot_key}_{selected_dataset}"
+            unique_plot_key += f"_{st.session_state.get('chart_revision', 0)}"
             
             # Determine if we should use container width or fixed width
             chart_width = "stretch" if st.session_state.get('plot_width_mode', 'container') == 'container' else "content"
             
-            plot_selection = st.plotly_chart(fig, width=chart_width, key=unique_plot_key, on_select="rerun", config=config)
+            plot_selection = st.plotly_chart(fig, width=chart_width, key=unique_plot_key, on_select="rerun",
+                                             selection_mode="box", config=config)
             
-            # Handle plot selection events
-            if plot_selection and 'selection' in plot_selection and plot_selection['selection']:
-                selection_data = plot_selection['selection']
-                
-                # Extract x-range from box selection
-                if 'box' in selection_data and selection_data['box']:
-                    boxes = selection_data['box']
-                    if len(boxes) > 0 and 'x' in boxes[0] and len(boxes[0]['x']) >= 2:
-                        x_range = boxes[0]['x']
-                        # Update session state with selection
-                        st.session_state.selected_start = float(min(x_range))
-                        st.session_state.selected_end = float(max(x_range))
-                        st.session_state.selected_for_dataset = selected_dataset
-                        st.session_state.selection_counter = st.session_state.get('selection_counter', 0) + 1
-                        st.rerun()
-            
-            # Display current selection, with a one-click way to analyze it
-            quick_add = False
-            if 'selected_start' in st.session_state and 'selected_end' in st.session_state:
-                target_dataset = st.session_state.get('selected_for_dataset', 'Unknown')
-                if target_dataset == selected_dataset:
-                    data_times = st.session_state.data_sets[selected_dataset]['time']
-                    shown_start = _clamp(st.session_state.selected_start, data_times.min(), data_times.max())
-                    shown_end = _clamp(st.session_state.selected_end, data_times.min(), data_times.max())
-                    info_col, add_col, clear_col = st.columns([3, 1.4, 1], vertical_alignment="center")
-                    with info_col:
-                        st.info(f"Selected on {selected_dataset}: {shown_start:.2f} s to {shown_end:.2f} s")
-                    with add_col:
-                        quick_add = st.button("➕ Add region from selection", type="primary", width="stretch",
-                                              help="Analyze the selection now, using the conversion settings below")
-                else:
-                    info_col, clear_col = st.columns([4.4, 1], vertical_alignment="center")
-                    with info_col:
-                        st.warning(f"Selection is for {target_dataset}, currently viewing {selected_dataset}. Switch datasets to use selection.")
-                with clear_col:
-                    if st.button("✖ Clear", key="clear_selection", width="stretch", help="Remove the current selection"):
-                        st.session_state.pop('selected_start', None)
-                        st.session_state.pop('selected_end', None)
-                        st.rerun()
+            # Handle a new box selection in this same run. The chart keeps showing
+            # Plotly's own selection box, so the figure doesn't change and isn't rebuilt.
+            boxes = ((plot_selection or {}).get('selection') or {}).get('box') or []
+            if boxes and len(boxes[0].get('x', [])) >= 2:
+                box_range = (float(min(boxes[0]['x'])), float(max(boxes[0]['x'])))
+                if box_range != st.session_state.get('last_box_range'):
+                    st.session_state.last_box_range = box_range
+                    st.session_state.selected_start, st.session_state.selected_end = box_range
+                    st.session_state.selected_for_dataset = selected_dataset
+                    st.session_state.selection_counter = st.session_state.get('selection_counter', 0) + 1
             
             # ====================
-            # SECTION 6: Region Analysis
+            # SECTION 6: Analysis (a fragment: changing its inputs doesn't redraw the chart)
             # ====================
-            st.subheader("Region Analysis")
-            
-            # Initialize regions for this dataset if not exists
             if selected_dataset not in st.session_state.regions:
                 st.session_state.regions[selected_dataset] = {}
-            
-            # Add new region section (keeping same interface as original)
-            with st.expander("Add New Region", expanded=True):
-                # Time range selection
-                col1, col2, col3 = st.columns([2, 2, 2])
-                
-                with col1:
-                    data_min = float(st.session_state.data_sets[selected_dataset]['time'].min())
-                    data_max = float(st.session_state.data_sets[selected_dataset]['time'].max())
-                    
-                    selection_counter = st.session_state.get('selection_counter', 0)
-                    has_selection = ('selected_start' in st.session_state and 
-                                   st.session_state.get('selected_for_dataset') == selected_dataset)
-                    
-                    if has_selection:
-                        default_start = _clamp(st.session_state.selected_start, data_min, data_max)
-                    else:
-                        default_start = data_min
-                    
-                    new_start = st.number_input(
-                        "Start (s)",
-                        min_value=data_min,
-                        max_value=data_max,
-                        value=float(default_start),
-                        step=0.1,
-                        format="%.2f",
-                        key=f"start_time_{selection_counter}",
-                        help="Start time of the region (auto-filled from plot selection)"
-                    )
-                
-                with col2:
-                    if has_selection:
-                        default_end = _clamp(st.session_state.selected_end, new_start, data_max)
-                    else:
-                        default_end = data_max
-                    
-                    new_end = st.number_input(
-                        "End (s)",
-                        min_value=new_start,
-                        max_value=data_max,
-                        value=float(default_end),
-                        step=0.1,
-                        format="%.2f",
-                        key=f"end_time_{selection_counter}",
-                        help="End time of the region (auto-filled from plot selection)"
-                    )
-                
-                with col3:
-                    existing_names = st.session_state.regions[selected_dataset]
-                    next_number = st.session_state.region_counter + 1
-                    while f"Region_{next_number}" in existing_names:
-                        next_number += 1
-                    region_name = st.text_input(
-                        "Region Name", 
-                        value=f"Region_{next_number}",
-                        key=f"new_region_name_{st.session_state.region_counter}"
-                    )
-                
-                conversion = self._render_conversion_controls(key_prefix="region_")
-                
-                # Add region button
-                if st.button("Add Region", type="primary", width="stretch") or quick_add:
-                    if region_name and region_name not in st.session_state.regions[selected_dataset]:
-                        with st.spinner('☕ Analyzing kinetics...'):
-                            result = self._calculate_slope(
-                                selected_dataset, new_start, new_end, region_name,
-                                conversion['extinction_coeff'], conversion['target_conc_unit'],
-                                conversion['target_time_unit'], conversion['enzyme_units'],
-                                conversion['path_length_cm']
-                            )
-                        
-                        if result:
-                            st.session_state.regions[selected_dataset][region_name] = result
-                            st.session_state.region_counter += 1
-                            
-                            # Clear the selection after successful region addition
-                            if 'selected_start' in st.session_state:
-                                del st.session_state.selected_start
-                            if 'selected_end' in st.session_state:
-                                del st.session_state.selected_end
-                            
-                            st.success(f"✅ Added region: {region_name}")
-                            st.rerun()
-                    else:
-                        st.error("Region name already exists or is empty")
+            self._analysis_panel(selected_dataset, overlay_datasets if show_overlay else [])
             
             # ====================
             # SECTION 7: Results Display
@@ -1933,45 +1869,7 @@ class EnzymeKineticsStreamlit:
                         st.success(f"Deleted region: {region_name}")
                         st.rerun()
         
-        # Batch Analysis Results Section
-        # Collect all batch regions across all datasets
-        batch_regions = {}
-        for dataset_name, regions_dict in st.session_state.regions.items():
-            for region_name, region_data in regions_dict.items():
-                if region_name.startswith('Batch_'):
-                    # Extract batch number from region name (e.g., "Batch_1_1.xlsx" -> "1")
-                    batch_parts = region_name.split('_')
-                    if len(batch_parts) >= 2:
-                        batch_number = batch_parts[1]
-                        if batch_number not in batch_regions:
-                            batch_regions[batch_number] = []
-                        batch_regions[batch_number].append((region_name, region_data, dataset_name))
-        
-        # Display batch results if any exist
-        if batch_regions:
-            title_col, clear_col = st.columns([3, 1], vertical_alignment="bottom")
-            with title_col:
-                st.subheader("Batch Analysis Results")
-            with clear_col:
-                if st.button("🗑️ Clear all", key="clear_batch_results", width="stretch", help="Delete every batch result"):
-                    for batch_data in batch_regions.values():
-                        for region_name, _, dataset_name in batch_data:
-                            del st.session_state.regions[dataset_name][region_name]
-                    st.rerun()
-
-            for batch_number in sorted(batch_regions, key=lambda number: int(number) if number.isdigit() else 0):
-                batch_data = batch_regions[batch_number]
-                st.write(f"**Batch {batch_number}** ({len(batch_data)} datasets)")
-
-                for region_name, region_data, dataset_name in batch_data:
-                    delete_key = f"delete_batch_{dataset_name}_{region_name}"
-                    if self._display_region_result(region_name, region_data, delete_key,
-                                                    show_dataset=True, dataset_name=dataset_name):
-                        del st.session_state.regions[dataset_name][region_name]
-                        st.success(f"Deleted batch region: {region_name}")
-                        st.rerun()
-
-                st.divider()
+        self._render_batch_results()
         
         # ====================
         # SECTION 8: Export
@@ -1981,167 +1879,7 @@ class EnzymeKineticsStreamlit:
             for region_name, region_data in regions_dict.items():
                 all_regions.append(region_data)
 
-        if all_regions:
-            st.divider()
-            st.subheader("Export All Results")
-            
-            results_df = kinetics_core.results_table(all_regions)
-            if not results_df.empty:
-                scientific = st.column_config.NumberColumn(format="%.3e")
-                st.dataframe(results_df, width="stretch", hide_index=True, column_config={
-                    'Start_Time': st.column_config.NumberColumn(format="%.2f"),
-                    'End_Time': st.column_config.NumberColumn(format="%.2f"),
-                    'Slope': scientific, 'Std_Error_Converted': scientific,
-                    'Original_Slope_UA_s': scientific, 'Original_Std_Error': scientific,
-                    'R_Squared': st.column_config.NumberColumn(format="%.4f"),
-                    'RMSE': scientific,
-                    'Mean_Absorbance': st.column_config.NumberColumn(format="%.4f"),
-                    'Absorbance_Std_Dev': st.column_config.NumberColumn(format="%.4f"),
-                    'Enzyme_Activity': st.column_config.NumberColumn(format="%.4f"),
-                    'Enzyme_Activity_Std_Error': st.column_config.NumberColumn(format="%.4f"),
-                })
-                
-                # Export options
-                st.subheader("Export Options")
-                col1, col2 = st.columns([2, 1])
-                
-                with col1:
-                    st.write("**Select optional data to export:**")
-                    st.caption("Basic information, statistical data (R², Number of Points), and RMSE are always included")
-                    
-                    available_columns = list(results_df.columns)
-                    mandatory_columns = {
-                        'Dataset', 'Region', 'Start_Time', 'End_Time', 
-                        'R_Squared', 'Number_of_Points', 'RMSE'
-                    }
-                    
-                    export_cols = {}
-                    col_a, col_b = st.columns(2)
-                    
-                    with col_a:
-                        export_cols['Slope'] = st.checkbox(
-                            "Transformed Slope",
-                            value=True,
-                            key="export_transformed_slope",
-                            help="Includes slope values, units, and standard error"
-                        )
-                        
-                        export_cols['Original_Slope_UA_s'] = st.checkbox(
-                            "Original Slope",
-                            value=True,
-                            key="export_original_slope",
-                            help="Includes original slope (UA/s) and standard error"
-                        )
-                    
-                    with col_b:
-                        export_cols['Mean_Absorbance'] = st.checkbox(
-                            "Mean Absorbance",
-                            value=True,
-                            key="export_mean_absorbance",
-                            help="Mean absorbance value and standard deviation for each region"
-                        )
-                        
-                        export_cols['Extinction_Coeff'] = st.checkbox(
-                            "Extinction Coefficient",
-                            value=False,
-                            key="export_extinction_coeff",
-                            help="Extinction coefficient used in calculations"
-                        )
-                        
-                        if 'Enzyme_Activity' in available_columns:
-                            export_cols['Enzyme_Activity'] = st.checkbox(
-                                "Enzyme Activity",
-                                value=True,
-                                key="export_enzyme_activity",
-                                help="Includes enzyme activity values and units"
-                            )
-                
-                with col2:
-                    st.write("**Export Settings:**")
-                    
-                    custom_filename = st.text_input(
-                        "Filename (without extension)",
-                        value="kinetics_analysis_results",
-                        help="Enter filename without extension"
-                    )
-                    
-                    export_format = st.selectbox(
-                        "Export Format",
-                        ["Excel (.xlsx)", "CSV (.csv)"],
-                        index=0,
-                        help="File format for export"
-                    )
-                
-                # Handle column dependencies and create download
-                selected_columns = [col for col, selected in export_cols.items() if selected]
-                final_columns = set(mandatory_columns.intersection(available_columns))
-                
-                # Add selected columns and dependencies
-                for col in selected_columns:
-                    final_columns.add(col)
-                    
-                    if col == 'Slope':
-                        if 'Slope_Units' in available_columns:
-                            final_columns.add('Slope_Units')
-                        if 'Std_Error_Converted' in available_columns:
-                            final_columns.add('Std_Error_Converted')
-                    elif col == 'Original_Slope_UA_s':
-                        if 'Original_Std_Error' in available_columns:
-                            final_columns.add('Original_Std_Error')
-                    elif col == 'Mean_Absorbance':
-                        if 'Absorbance_Std_Dev' in available_columns:
-                            final_columns.add('Absorbance_Std_Dev')
-                    elif col == 'Enzyme_Activity':
-                        if 'Enzyme_Activity_Units' in available_columns:
-                            final_columns.add('Enzyme_Activity_Units')
-                        if 'Enzyme_Activity_Std_Error' in available_columns:
-                            final_columns.add('Enzyme_Activity_Std_Error')
-                    elif col == 'Extinction_Coeff':
-                        if 'Path_Length_cm' in available_columns:
-                            final_columns.add('Path_Length_cm')
-                
-                final_columns_list = [col for col in available_columns if col in final_columns]
-                
-                if final_columns_list:
-                    filtered_df = results_df[final_columns_list]
-                    
-                    # Create file data based on format
-                    if export_format == "CSV (.csv)":
-                        file_extension = ".csv"
-                        mime_type = "text/csv"
-                    else:  # Excel
-                        file_extension = ".xlsx"
-                        mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    
-                    filename = f"{custom_filename}{file_extension}"
-                    
-                    output = io.BytesIO()
-                    if export_format == "CSV (.csv)":
-                        # BOM so Excel opens µ and other symbols correctly
-                        output.write(filtered_df.to_csv(index=False).encode('utf-8-sig'))
-                    else:  # Excel
-                        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                            filtered_df.to_excel(writer, index=False, sheet_name='Results')
-                    
-                    output.seek(0)
-                    
-                    st.download_button(
-                        label="📥 Download Results",
-                        data=output.getvalue(),
-                        file_name=filename,
-                        mime=mime_type,
-                        width="stretch",
-                        type="primary"
-                    )
-                    
-                    # Show auto-included columns info
-                    auto_included = [col for col in final_columns_list if col not in selected_columns]
-                    if auto_included:
-                        st.info(f"Auto-included: {', '.join(auto_included)}")
-                    
-                    st.success(f"Ready to download {len(filtered_df)} rows with {len(final_columns_list)} columns")
-                else:
-                    st.warning("Please select at least one optional column to export")
+        self._export_section(all_regions)
 
 # Run the application
 if __name__ == "__main__":
