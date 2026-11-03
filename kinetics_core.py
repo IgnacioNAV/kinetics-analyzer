@@ -96,6 +96,27 @@ def read_text_table(text: str) -> pd.DataFrame:
     return standardize_columns(df)
 
 
+def avaspec_txt(data: pd.DataFrame, original_name: str, experiment_date=None) -> str:
+    """Tab-separated TXT (with a provenance header) for converted AvaSpec data."""
+    header = [
+        "##################################################",
+        "# DATA EXPORT AND TRANSFORMATION REPORT",
+        "#",
+        f"# Original File: {original_name}",
+        *([f"# Experiment Start Date/Time: {experiment_date}"] if experiment_date is not None else []),
+        f"# Processing Date: {datetime.now()}",
+        "#",
+        "# Operations Performed:",
+        "# - Column 1 (Time): Read from Excel Column B (milliseconds), divided by 1000.",
+        "# - Column 2 (Absorbance): Read from Excel Column C, comma decimal converted to dot decimal.",
+        "##################################################",
+        "",
+        "Time (s)\tUA",
+    ]
+    rows = (f"{time}\t{product}" for time, product in zip(data['time'], data['product']))
+    return '\n'.join([*header, *rows]) + '\n'
+
+
 def parse_avaspec_rows(raw_df: pd.DataFrame) -> pd.DataFrame:
     """Convert AvaSpec rows (column B = time in ms, column C = absorbance) to time (s) / product."""
     valid_rows = []
@@ -287,3 +308,63 @@ def results_table(regions: List[Dict]) -> pd.DataFrame:
             row['Enzyme_Activity_Std_Error'] = region.get('enzyme_activity_std_error')
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+# Shown in the app header and at the end of the AvaSpec converter
+QUOTES = [
+    'The only way to make sense out of change is to plunge into it, move with it, and join the dance - Watts',
+    'What we observe is not nature itself, but nature exposed to our method of questioning - Heisenberg',
+    'Kinetics tells us how fast, thermodynamics tells us how far',
+    'Every reaction has its optimal path - trust the data to show you',
+    'R² > 0.99: Excellent fit. R² < 0.98: Time for coffee and reconsideration',
+    'The enzyme knows chemistry better than the chemist',
+    'Linear kinetics: when enzymes behave like good students',
+    "Why don't enzymes ever get tired? They have infinite turnover rates in their dreams",
+    'Enzymes are like good friends: they lower your activation energy for getting things done',
+    'What did the substrate say to the enzyme? You complete me... by breaking me apart',
+    'Allosteric enzymes: proof that proteins have mood swings',
+    "Fact: Some enzymes are so efficient they approach the diffusion limit - nature's speed demons",
+    'Enzymes: billions of years of R&D, no patents required',
+    "DNA: the world's most successful backup system (with occasional corrupted files)",
+    'RNA: Jack of all trades, master of everything - sorry proteins!',
+    "Ribozymes proved that RNA doesn't need protein chaperones to get things done",
+    "DNA polymerase has 3' to 5' exonuclease activity because even evolution believes in proofreading",
+    'Why did the ribosome break up with the polysome? Too much translation drama',
+    'Fact: Your DNA contains the instructions for about 20,000-25,000 proteins (assembly required)',
+    'Telomerase: the enzyme trying to make you immortal (aging has entered the chat)',
+    "DNA repair mechanisms: your genome's personal IT department working 24/7",
+    "Why don't DNA strands ever get lost? They always know their 5' from their 3' end",
+    'LUCA (Last Universal Common Ancestor): the ultimate single parent raising 4 billion years of offspring',
+    'RNA World hypothesis: back when RNA was CEO, CFO, and the entire workforce',
+    "Primordial soup: Earth's first attempt at molecular cuisine (no recipe book included)",
+    'Iron-sulfur clusters: the original catalysts, still going strong after 3.8 billion years',
+    'Miller-Urey experiment: proof that you can make amino acids from lightning and patience',
+    'Fact: Cyanobacteria invented photosynthesis and accidentally created the oxygen apocalypse',
+    "Hydrothermal vents: where life possibly started in nature's pressure cookers",
+    'Self-replication: the ultimate mystery - how did molecules learn to copy themselves?',
+    'From chemistry to biology: the greatest startup story never fully documented',
+    'Autocatalytic networks: when molecules formed the first self-sustaining businesses',
+    'Evolution: 4 billion years of A/B testing with no rollback option',
+    'Endosymbiotic theory: the first successful corporate merger in cellular history',
+    'In God we trust, all others must bring data - Deming',
+    "The best thing about being a statistician is that you get to play in everyone's backyard - Tukey",
+    "Without data, you're just another person with an opinion - Edwards",
+    'Correlation does not imply causation, but it does waggle its eyebrows suggestively',
+    'A good plot is worth a thousand p-values',
+    'Caffeine: the molecule that powers science',
+    'Good coffee, good data, good science',
+    'Lab rule #1: Never trust data collected before the first cup of coffee',
+    'Science runs on coffee and curiosity',
+    'The universal solvent for scientific problems: coffee',
+    'Fact: Your morning coffee contains over 1000 different chemical compounds',
+    'Fact: Ribozymes can cut and paste RNA like molecular scissors and glue',
+    'Fact: The ribosome is a ribozyme - your protein factory is made of RNA',
+    'Fact: Some RNA molecules can evolve in test tubes in just hours',
+    'Fact: DNA repair enzymes fix about 1000 DNA damages per cell per day - busy little workers',
+    'Science is not only compatible with spirituality; it is a profound source of spirituality - Sagan',
+    'Fact: If you stretched out all the DNA in your body, it would reach the sun and back 300 times',
+    'RNA splicing: where introns go to disappear and exons get their moment to shine',
+    'Fact: All life shares the same genetic code because we all descended from one successful experiment',
+    'Fact: The Michaelis-Menten equation was derived in 1913 - still going strong!',
+    'Fact: Data conversion is the bridge between raw measurements and scientific insights',
+]
